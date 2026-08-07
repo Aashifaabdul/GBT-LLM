@@ -1,0 +1,29 @@
+# Raw/large regenerable data
+*.yuv
+*.7z
+**/frames/*.png
+**/blocks/
+**/context/
+**/block_overlay/
+**/reconstructed/
+**/original_crop/
+**/reconstructed_video.mp4
+**/original_video.mp4
+
+# Checkpoints and results (regenerable via training.py / run_dataset_pipeline.py)
+checkpoints/*.pt
+results/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+
+# Editors/OS
+.DS_Store
+Thumbs.db
+
+# Keep small tracked artifacts explicitly (negation patterns, evaluated last)
+!figures/.gitkeep
