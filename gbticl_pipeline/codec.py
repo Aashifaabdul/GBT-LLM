@@ -39,7 +39,7 @@ from .graph_model import UniformGBTICL, GBTICLMetaLearner
 from .graph_utils import build_laplacian, eigendecompose
 from .gft import forward_gft, inverse_gft
 from .quantization import quantize, dequantize
-from .coeff_model import LaplaceCoeffModel, TinyTransformerCoeffModel
+from .coeff_model import LaplaceCoeffModel, TinyTransformerCoeffModel, HFLoRACoeffModel
 from .context import get_context, get_block, set_block, get_support_set
 from .range_coder import RangeEncoder, RangeDecoder, encode_symbol, decode_symbol
 from .device_utils import get_device
@@ -190,7 +190,7 @@ def _supports_context_set(gbticl_model):
 
 
 def _supports_temporal_coeffs(coeff_model):
-    return isinstance(coeff_model, TinyTransformerCoeffModel)
+    return isinstance(coeff_model, (TinyTransformerCoeffModel, HFLoRACoeffModel))
 
 
 def encode_video(frames_np, block_size=8, quant_step=8.0,

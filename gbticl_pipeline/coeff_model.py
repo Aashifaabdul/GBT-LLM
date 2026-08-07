@@ -364,29 +364,75 @@ class TinyTransformerCoeffModel(CoeffPredictor):
 
 class HFLoRACoeffModel(CoeffPredictor):
     """
-    Optional: wraps a real pretrained causal LM (via HuggingFace
-    `transformers`) fine-tuned with LoRA adapters (`peft`) as the coefficient
-    predictor -- the closer match to the original LLaMA-3 + LoRA design.
+    The real pretrained-LLM coefficient predictor: wraps a real pretrained
+    causal LM (HuggingFace `transformers`), fine-tuned with LoRA adapters
+    (`peft`) -- this is what satisfies "repurpose a real pretrained LLM" for
+    coefficient prediction (as opposed to TinyTransformerCoeffModel, a small
+    transformer trained from scratch only on this task; that class stays as
+    an explicit ablation baseline for exactly this comparison).
+
+    Default base model: distilgpt2 (82M params, 6 layers, hidden=768).
+    Chosen because (a) it's unambiguously "a real pretrained LLM" while
+    leaving large VRAM headroom on an 8GB card, (b) OpenAI's GPT-2 license
+    permits this use, (c) `target_modules=["c_attn"]` below matches its
+    architecture directly. `HuggingFaceTB/SmolLM2-135M` (Apache-2.0,
+    `target_modules=["q_proj","v_proj"]`, already the fallback branch below)
+    is a documented drop-in alternative for a more modern base model.
 
     Rather than tokenising coefficients as text, this feeds `inputs_embeds`
     directly (a standard technique): each position's embedding is built the
-    same way as TinyTransformerCoeffModel's (value + eigval + position),
-    projected up to the LM's hidden size, run through the frozen
-    (LoRA-adapted) LM, and the final hidden state is projected back down to
-    logits over symbol_range by a small trained head. The LM's own
+    same way as TinyTransformerCoeffModel's (value + eigval + position +
+    optional cross-frame temporal value, see coeff_model.py's module-level
+    note on that), projected up to the LM's hidden size, run through the
+    frozen (LoRA-adapted) LM, and the final hidden state is projected back
+    down to logits over symbol_range by a small trained head. The LM's own
     token-embedding matrix and vocabulary are not used at all -- only its
-    pretrained transformer *body* and attention patterns are being reused
-    and lightly adapted.
+    pretrained transformer *body* and attention patterns are reused and
+    lightly adapted.
 
-    NOT exercised in this environment: instantiating this needs
-    `pip install transformers peft`, an internet connection to download the
-    base model, and materially more GPU memory than TinyTransformerCoeffModel.
-    Import is deferred into __init__ specifically so the rest of this file
-    (and the whole pipeline) still works with only plain PyTorch installed.
+    VRAM-fitting design (see class docstring continuation in __init__):
+    frozen base loaded in bfloat16, gradient checkpointing enabled, only
+    LoRA adapters + the small head modules (kept in fp32 for stable
+    optimization) are trainable.
+
+    KV-CACHING (symbol_probs): unlike TinyTransformerCoeffModel's
+    from-scratch encoder (no native cache support, O(n^3) decode cost -- see
+    its class docstring), this class uses the underlying HF model's native
+    `past_key_values`/`use_cache=True` support to make incremental decoding
+    O(n^2) like normal autoregressive generation.
+
+    MULTI-SLOT, not single-slot (bug found and fixed during testing): both
+    decode_image and decode_video call symbol_probs in INTERLEAVED order --
+    for k in range(n): for ch in range(3): symbol_probs(...) -- i.e. three
+    independent per-channel sequences advance one step at a time, round-
+    robin, not one whole channel at a time. A single shared cache slot on
+    the model instance is wrong here: it would attend with position-k's
+    attention_mask length but only the *previous channel's* cached K/V,
+    silently corrupting every channel-switch (confirmed: with a single-slot
+    cache, this desynced ~98% of symbols within one block on real image
+    data). Fixed with a small dict of caches keyed by `id(history)`:
+    codec.py's decode loops build one persistent Python list per (block,
+    channel) -- `history[ch]`, mutated via .append() across the k=0..n-1
+    calls for that channel -- so the *same list object* recurs on every
+    call within one channel's decode, letting each channel's cache be kept
+    independently without changing codec.py's calling convention or the
+    shared CoeffPredictor interface.
+
+    Robustness against Python `id()` reuse (a freed list's memory address
+    being reassigned to an unrelated new list): every cache entry also
+    records the expected history length: a `len(history) != expected`
+    mismatch is treated as a cache miss and triggers a safe "cold start"
+    recompute of the full 0..k prefix in one call (correct, just slower --
+    this is a defensive fallback for a scenario that shouldn't occur under
+    normal codec usage, not the expected hot path). The cache dict is also
+    capped in size (oldest entries evicted) so very long runs (thousands of
+    blocks) don't grow it unbounded.
     """
+    _MAX_CACHE_SLOTS = 8
 
-    def __init__(self, base_model_name="gpt2", lora_r=8, lora_alpha=16,
-                 block_size=8, symbol_range=(-2200, 2200)):
+    def __init__(self, base_model_name="distilgpt2", lora_r=8, lora_alpha=16,
+                 lora_dropout=0.05, block_size=8, symbol_range=(-2200, 2200),
+                 lm_dtype=None):
         super().__init__()
         try:
             from transformers import AutoModel
@@ -403,57 +449,197 @@ class HFLoRACoeffModel(CoeffPredictor):
         self.symbol_range = tuple(symbol_range)
         n_symbols = symbol_range[1] - symbol_range[0] + 1
         self.n = block_size * block_size
+        # bfloat16 for the frozen base: well-supported and numerically stable
+        # on Ada/Blackwell-class Tensor Cores (this project's target GPU),
+        # no loss-scaler needed unlike fp16. CPU-only fallback uses fp32
+        # (bf16 matmuls are slow/unsupported on many CPUs).
+        self.lm_dtype = lm_dtype or (torch.bfloat16 if torch.cuda.is_available() else torch.float32)
 
-        base = AutoModel.from_pretrained(base_model_name)
+        base = AutoModel.from_pretrained(base_model_name, dtype=self.lm_dtype)
         lora_cfg = LoraConfig(
             r=lora_r, lora_alpha=lora_alpha,
-            target_modules=["c_attn"] if base_model_name.startswith("gpt2") else ["q_proj", "v_proj"],
-            lora_dropout=0.05, bias="none",
+            target_modules=["c_attn"] if base_model_name.startswith(("gpt2", "distilgpt2")) else ["q_proj", "v_proj"],
+            lora_dropout=lora_dropout, bias="none",
         )
+        # required for LoRA to receive gradients when the model's INPUT is
+        # inputs_embeds (not token ids through the frozen embedding table,
+        # which is what enable_input_require_grads() normally hooks) --
+        # gradient checkpointing needs this too, or backprop silently stops
+        # at the first checkpointed layer
+        base.gradient_checkpointing_enable()
+        base.enable_input_require_grads()
         self.lm = get_peft_model(base, lora_cfg)  # base weights frozen; only LoRA adapters train
         d_model = base.config.hidden_size
 
+        # heads kept in fp32 (not lm_dtype) for stable optimization -- cheap:
+        # out_proj is the largest of these at d_model*n_symbols params, still
+        # a few MB even at fp32 with Adam's two fp32 moment buffers
         self.value_embed = nn.Sequential(nn.Linear(2, d_model), nn.GELU(), nn.Linear(d_model, d_model))
         self.eigval_embed = nn.Sequential(nn.Linear(1, d_model), nn.GELU(), nn.Linear(d_model, d_model))
         self.pos_embed = nn.Embedding(self.n, d_model)
         self.bos = nn.Parameter(torch.zeros(d_model))
+        self.temporal_value_embed = nn.Sequential(nn.Linear(2, d_model), nn.GELU(), nn.Linear(d_model, d_model))
+        self.no_temporal = nn.Parameter(torch.zeros(d_model))
         self.out_proj = nn.Linear(d_model, n_symbols)
+
+        # {id(history): (past_key_values, expected_len)} -- see class
+        # docstring's KV-CACHING section for why this must be multi-slot
+        self._kv_caches = {}
 
     def _value_feat(self, values):
         scaled = values / 256.0
         logmag = torch.sign(values) * torch.log1p(torch.abs(values)) / 8.0
         return torch.stack([scaled, logmag], dim=-1)
 
-    def _embeds(self, eigvals, prev_values, device):
+    def _embed_positions(self, eigvals, prev_values, pos_start, device, temporal_values=None):
+        """Build embeddings for a contiguous range of positions
+        [pos_start, pos_start+len(eigvals)) -- used both for a full-sequence
+        forward pass (pos_start=0) and for a single new position during
+        incremental KV-cached decoding (pos_start=k, len==1).
+
+        eigvals, prev_values: (n_pos,). temporal_values: optional (n_pos,).
+        Returns: (1, n_pos, d_model) in fp32 (caller casts to lm_dtype).
+        """
         n_pos = eigvals.shape[0]
-        val_emb = self.value_embed(self._value_feat(prev_values)).clone()
-        val_emb[0] = self.bos
+        val_emb = self.value_embed(self._value_feat(prev_values))
+        if pos_start == 0:
+            val_emb = val_emb.clone()
+            val_emb[0] = self.bos  # position 0 has no predecessor coefficient
         eig_emb = self.eigval_embed(eigvals.to(torch.float32).unsqueeze(-1))
-        pos = self.pos_embed(torch.arange(n_pos, device=device))
-        return (val_emb + eig_emb + pos).unsqueeze(0)  # (1, n_pos, d_model)
+        positions = torch.arange(pos_start, pos_start + n_pos, device=device)
+        pos = self.pos_embed(positions)
+        if temporal_values is not None:
+            temp_emb = self.temporal_value_embed(self._value_feat(temporal_values))
+        else:
+            temp_emb = self.no_temporal.to(val_emb.dtype).expand(n_pos, -1)
+        return (val_emb + eig_emb + pos + temp_emb).unsqueeze(0)  # (1, n_pos, d)
 
-    def _run(self, inputs_embeds):
+    def _run_full(self, inputs_embeds):
+        """Full-sequence forward pass, no cache -- used by forward_sequence
+        (training / encoder-side precompute_encode_probs, teacher-forced,
+        parallel over the whole block/channel in one call)."""
         attn = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=inputs_embeds.device)
-        out = self.lm(inputs_embeds=inputs_embeds, attention_mask=attn)
-        return out.last_hidden_state  # (1, n_pos, d_model)
+        out = self.lm(inputs_embeds=inputs_embeds.to(self.lm_dtype), attention_mask=attn)
+        return out.last_hidden_state.to(torch.float32)  # (1, n_pos, d)
 
-    def forward_sequence(self, eigvals, true_values):
+    def forward_sequence(self, eigvals, true_values, temporal_values=None):
         device = eigvals.device
         n = eigvals.shape[0]
         prev = torch.zeros(n, device=device, dtype=torch.float32)
         prev[1:] = true_values[:-1].to(torch.float32)
-        hidden = self._run(self._embeds(eigvals, prev, device))
+        embeds = self._embed_positions(eigvals, prev, 0, device, temporal_values=temporal_values)
+        hidden = self._run_full(embeds)
         return self.out_proj(hidden[0])
 
-    def symbol_probs(self, eigvals, k, history, symbol_range):
-        assert tuple(symbol_range) == self.symbol_range
-        device = next(self.parameters()).device
-        eigvals = eigvals.to(device=device, dtype=torch.float32)
+    def _evict_cache_if_full(self):
+        if len(self._kv_caches) > self._MAX_CACHE_SLOTS:
+            # crude but safe: drop the oldest entry (dict preserves insertion
+            # order in Python 3.7+); anything evicted just becomes a cache
+            # miss later, handled correctly (if slower) by the cold-start
+            # fallback below -- never a correctness issue, only a speed one
+            oldest_key = next(iter(self._kv_caches))
+            del self._kv_caches[oldest_key]
+
+    def _cold_start(self, eigvals, history, k, device, temporal_values=None):
+        """Rebuild the full 0..k prefix in one forward pass (no cache reuse)
+        -- the safe fallback for a genuine cache miss (first call for this
+        history, or a length-mismatch indicating a stale/evicted/colliding
+        slot -- see class docstring). Returns (hidden_state_at_k, past_key_values)."""
         n_pos = k + 1
         prev = torch.zeros(n_pos, device=device, dtype=torch.float32)
         if history:
             prev[1:] = torch.tensor(history, device=device, dtype=torch.float32)
-        hidden = self._run(self._embeds(eigvals[:n_pos], prev, device))
-        logits = self.out_proj(hidden[0, -1]).to(torch.float64)
+        temp = None
+        if temporal_values is not None:
+            temp = temporal_values[:n_pos].to(device=device, dtype=torch.float32)
+        embed = self._embed_positions(eigvals[:n_pos], prev, 0, device, temporal_values=temp)
+        attn = torch.ones((1, n_pos), dtype=torch.long, device=device)
+        out = self.lm(inputs_embeds=embed.to(self.lm_dtype), attention_mask=attn, use_cache=True)
+        return out.last_hidden_state[0, -1].to(torch.float32), out.past_key_values
+
+    def symbol_probs(self, eigvals, k, history, symbol_range, temporal_values=None):
+        """Decoder-side, incremental, KV-cached (see class docstring's
+        MULTI-SLOT section: caches are keyed by id(history) since decode
+        interleaves 3 channels' sequences round-robin, not one at a time).
+        temporal_values, if given, is the full (n,) previous-frame-
+        coefficient array for this block/channel -- only temporal_values[k]
+        is used per call."""
+        assert tuple(symbol_range) == self.symbol_range
+        device = next(self.parameters()).device
+        eigvals = eigvals.to(device=device, dtype=torch.float32)
+        cache_key = id(history)
+
+        if k == 0:
+            self._kv_caches.pop(cache_key, None)  # fresh sequence, discard any stale/colliding entry
+            temp_val = temporal_values[0:1].to(device=device, dtype=torch.float32) if temporal_values is not None else None
+            embed = self._embed_positions(eigvals[0:1], torch.zeros(1, device=device, dtype=torch.float32),
+                                           0, device, temporal_values=temp_val)
+            attn = torch.ones((1, 1), dtype=torch.long, device=device)
+            out = self.lm(inputs_embeds=embed.to(self.lm_dtype), attention_mask=attn, use_cache=True)
+            hidden = out.last_hidden_state[0, -1].to(torch.float32)
+            self._kv_caches[cache_key] = (out.past_key_values, 1)
+            self._evict_cache_if_full()
+        else:
+            cached = self._kv_caches.get(cache_key)
+            if cached is not None and cached[1] == k and len(history) == k:
+                # hot path: reuse cache, feed only the single new token
+                past, _ = cached
+                prev_val = torch.tensor([float(history[-1])], device=device, dtype=torch.float32)
+                temp_val = temporal_values[k:k + 1].to(device=device, dtype=torch.float32) if temporal_values is not None else None
+                embed = self._embed_positions(eigvals[k:k + 1], prev_val, k, device, temporal_values=temp_val)
+                attn = torch.ones((1, k + 1), dtype=torch.long, device=device)
+                out = self.lm(inputs_embeds=embed.to(self.lm_dtype), attention_mask=attn,
+                               past_key_values=past, use_cache=True)
+                hidden = out.last_hidden_state[0, -1].to(torch.float32)
+                self._kv_caches[cache_key] = (out.past_key_values, k + 1)
+            else:
+                # cold path: cache miss (first call at k>0 for this key, or a
+                # length mismatch -- see class docstring's id()-reuse note)
+                hidden, past = self._cold_start(eigvals, history, k, device, temporal_values=temporal_values)
+                self._kv_caches[cache_key] = (past, k + 1)
+                self._evict_cache_if_full()
+
+        logits = self.out_proj(hidden).to(torch.float64)
         probs = F.softmax(logits, dim=-1) + 1e-6
         return probs / probs.sum()
+
+    def precompute_encode_probs(self, eigvals, true_values, symbol_range, temporal_values=None):
+        """
+        ENCODER-ONLY, but deliberately NOT a parallel/batched shortcut
+        (unlike TinyTransformerCoeffModel's, or an earlier version of this
+        method): loops through symbol_probs exactly like decode_image/
+        decode_video will, one symbol at a time per channel, reusing its
+        KV-cache. This guarantees BIT-IDENTICAL probabilities to the
+        decoder, which turned out to matter here specifically: a real
+        pretrained LM run in bfloat16 does NOT give bit-identical results
+        between "one parallel forward pass over the whole teacher-forced
+        sequence" and "many incremental KV-cached forward calls, one new
+        position at a time" -- confirmed by direct testing, differences of
+        ~0.005-0.02 in the resulting probabilities, easily enough to shift
+        the integer frequency table (range_coder.py's TOTAL_FREQ=16384
+        precision) and silently desync the decoder starting from the very
+        first symbol (observed: PSNR collapsing to ~5dB on real image data).
+        TinyTransformerCoeffModel does NOT have this problem (verified
+        directly, exact match at real coefficient scale) because it runs in
+        plain fp32 and recomputes attention from scratch on every call
+        either way -- there is no separate "batched" vs "cached" code path
+        for its numerics to diverge between. This method is still
+        meaningfully faster than "no cache at all" thanks to symbol_probs'
+        own id(history)-keyed KV-caching, just not as fast as a true single
+        parallel forward pass would be if it were numerically safe here.
+        """
+        assert tuple(symbol_range) == self.symbol_range
+        device = next(self.parameters()).device
+        eigvals = eigvals.to(device=device, dtype=torch.float32)
+        n = eigvals.shape[0]
+        lo, hi = symbol_range
+        n_symbols = hi - lo + 1
+        out = torch.zeros(n, 3, n_symbols, dtype=torch.float64, device=device)
+        for ch in range(3):
+            history = []
+            temp_ch = temporal_values[:, ch] if temporal_values is not None else None
+            kwargs = {"temporal_values": temp_ch} if temp_ch is not None else {}
+            for k in range(n):
+                out[k, ch] = self.symbol_probs(eigvals, k, history, symbol_range, **kwargs)
+                history.append(int(true_values[k, ch].item()))
+        return out
