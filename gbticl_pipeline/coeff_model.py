@@ -205,6 +205,28 @@ class TinyTransformerCoeffModel(CoeffPredictor):
         self.pos_embed = nn.Embedding(self.n, d_model)
         self.bos = nn.Parameter(torch.zeros(d_model))  # learned "no history yet" embedding
 
+        # Optional cross-frame conditioning (encode_video/decode_video, codec.py):
+        # at position k, the previous frame's co-located block's DECODED
+        # quantized coefficient at the same frequency index k, embedded the
+        # same way as this frame's own history values and summed in. Off by
+        # default (temporal_values=None everywhere below falls back to the
+        # learned `no_temporal` embedding), so the plain per-image path
+        # (encode_image/decode_image, no video/temporal context) is
+        # completely unaffected -- this only activates when the caller
+        # actually has cross-frame data to offer.
+        #
+        # KNOWN LIMITATION (documented, not hidden): GBTICLMetaLearner's
+        # predicted eigenbasis can shift block-to-block, so "frequency index
+        # k" is only an approximate cross-frame correspondence, not the same
+        # physical basis vector every frame. See run_dataset_pipeline.py's
+        # ablation matrix for an explicit on/off comparison of whether this
+        # conditioning actually helps given that misalignment risk, rather
+        # than assuming it does.
+        self.temporal_value_embed = nn.Sequential(
+            nn.Linear(2, d_model), nn.GELU(), nn.Linear(d_model, d_model)
+        )
+        self.no_temporal = nn.Parameter(torch.zeros(d_model))
+
         layer = nn.TransformerEncoderLayer(
             d_model, n_heads, dim_feedforward=ff_mult * d_model,
             dropout=0.0, batch_first=True, activation="gelu",
@@ -222,13 +244,17 @@ class TinyTransformerCoeffModel(CoeffPredictor):
         logmag = torch.sign(values) * torch.log1p(torch.abs(values)) / 8.0
         return torch.stack([scaled, logmag], dim=-1)
 
-    def _tokens(self, eigvals, prev_values, device):
+    def _tokens(self, eigvals, prev_values, device, temporal_values=None):
         """Batched token builder -- the single implementation both
         forward_sequence (training, real batch size) and symbol_probs
         (inference, batch size 1) go through, so the two can never drift
         into architecturally different code paths.
 
         eigvals, prev_values: (B, n_pos) -> tokens: (B, n_pos, d_model)
+        temporal_values: optional (B, n_pos) -- previous frame's co-located
+            block's decoded coefficient at each position (see class
+            docstring); None means no cross-frame conditioning available,
+            uses the learned no_temporal fallback for every position.
         """
         b, n_pos = eigvals.shape
         val_emb = self.value_embed(self._value_feat(prev_values))  # (B,n_pos,d)
@@ -236,27 +262,38 @@ class TinyTransformerCoeffModel(CoeffPredictor):
         val_emb[:, 0] = self.bos  # position 0 has no predecessor coefficient
         eig_emb = self.eigval_embed(eigvals.to(torch.float32).unsqueeze(-1))  # (B,n_pos,d)
         pos = self.pos_embed(torch.arange(n_pos, device=device)).unsqueeze(0).expand(b, -1, -1)
-        return val_emb + eig_emb + pos
 
-    def forward_sequence(self, eigvals, true_values):
+        if temporal_values is not None:
+            temp_emb = self.temporal_value_embed(self._value_feat(temporal_values))  # (B,n_pos,d)
+        else:
+            temp_emb = self.no_temporal.to(val_emb.dtype).expand(b, n_pos, -1)
+
+        return val_emb + eig_emb + pos + temp_emb
+
+    def forward_sequence(self, eigvals, true_values, temporal_values=None):
         """Teacher-forced training pass.
         eigvals, true_values: (n,) for one sequence or (B, n) for a batch.
+        temporal_values: optional, same shape as true_values -- see
+            _tokens()'s docstring and the class docstring's cross-frame
+            conditioning note.
         Returns logits: (n, n_symbols) or (B, n, n_symbols) matching input rank.
         """
         squeeze = eigvals.dim() == 1
         if squeeze:
             eigvals, true_values = eigvals.unsqueeze(0), true_values.unsqueeze(0)
+            if temporal_values is not None:
+                temporal_values = temporal_values.unsqueeze(0)
         device = eigvals.device
         b, n = eigvals.shape
         prev = torch.zeros(b, n, device=device, dtype=torch.float32)
         prev[:, 1:] = true_values[:, :-1].to(torch.float32)
-        tokens = self._tokens(eigvals, prev, device)  # (B,n,d)
+        tokens = self._tokens(eigvals, prev, device, temporal_values=temporal_values)  # (B,n,d)
         mask = nn.Transformer.generate_square_subsequent_mask(n).to(device)
         out = self.encoder(tokens, mask=mask)
         logits = self.out_proj(out)  # (B,n,n_symbols)
         return logits.squeeze(0) if squeeze else logits
 
-    def symbol_probs(self, eigvals, k, history, symbol_range):
+    def symbol_probs(self, eigvals, k, history, symbol_range, temporal_values=None):
         """
         Decoder-side, incremental (one symbol at a time -- the decoder
         genuinely doesn't know later values yet). NO KV-cache: this rebuilds
@@ -266,6 +303,10 @@ class TinyTransformerCoeffModel(CoeffPredictor):
         (see the class docstring's PERFORMANCE NOTE). For the encoder side,
         use precompute_encode_probs instead (below) -- it needs none of this
         because the encoder already has every true value up front.
+
+        temporal_values: optional (n,) tensor -- the previous frame's
+            co-located block's decoded coefficients at positions 0..n-1 (only
+            0..k actually used here); None means no cross-frame conditioning.
         """
         assert tuple(symbol_range) == self.symbol_range, (
             f"TinyTransformerCoeffModel was built for symbol_range={self.symbol_range}, "
@@ -277,7 +318,11 @@ class TinyTransformerCoeffModel(CoeffPredictor):
         prev = torch.zeros(n_pos, device=device, dtype=torch.float32)
         if history:
             prev[1:] = torch.tensor(history, device=device, dtype=torch.float32)
-        tokens = self._tokens(eigvals[:n_pos].unsqueeze(0), prev.unsqueeze(0), device)  # (1,n_pos,d)
+        temp = None
+        if temporal_values is not None:
+            temp = temporal_values[:n_pos].to(device=device, dtype=torch.float32).unsqueeze(0)
+        tokens = self._tokens(eigvals[:n_pos].unsqueeze(0), prev.unsqueeze(0), device,
+                               temporal_values=temp)  # (1,n_pos,d)
         mask = nn.Transformer.generate_square_subsequent_mask(n_pos).to(device)
         out = self.encoder(tokens, mask=mask)
         logits = self.out_proj(out[0, -1]).to(torch.float64)  # (n_symbols,)
@@ -285,7 +330,7 @@ class TinyTransformerCoeffModel(CoeffPredictor):
         probs = probs + 1e-6
         return probs / probs.sum()
 
-    def precompute_encode_probs(self, eigvals, true_values, symbol_range):
+    def precompute_encode_probs(self, eigvals, true_values, symbol_range, temporal_values=None):
         """
         Encoder-side fast path: ONE batched forward pass (batch=3, one per
         colour channel) covering all 64 positions at once, teacher-forced
@@ -294,6 +339,10 @@ class TinyTransformerCoeffModel(CoeffPredictor):
         identical to symbol_probs (same _tokens()/encoder pipeline), just
         computed in parallel because the encoder is allowed to (it already
         has every true coefficient before it entropy-codes any of them).
+
+        temporal_values: optional (n, 3) tensor -- previous frame's
+            co-located block's decoded coefficients, same layout as
+            true_values; None means no cross-frame conditioning.
         """
         assert tuple(symbol_range) == self.symbol_range, (
             f"TinyTransformerCoeffModel was built for symbol_range={self.symbol_range}, "
@@ -303,8 +352,11 @@ class TinyTransformerCoeffModel(CoeffPredictor):
         eigvals = eigvals.to(device=device, dtype=torch.float32)
         true_vals_rep = true_values.to(device=device, dtype=torch.float32).transpose(0, 1)  # (3, n)
         eigvals_rep = eigvals.unsqueeze(0).expand(3, -1)  # (3, n)
+        temporal_rep = None
+        if temporal_values is not None:
+            temporal_rep = temporal_values.to(device=device, dtype=torch.float32).transpose(0, 1)  # (3, n)
 
-        logits = self.forward_sequence(eigvals_rep, true_vals_rep)  # (3, n, n_symbols)
+        logits = self.forward_sequence(eigvals_rep, true_vals_rep, temporal_values=temporal_rep)  # (3, n, n_symbols)
         probs = F.softmax(logits.to(torch.float64), dim=-1) + 1e-6
         probs = probs / probs.sum(dim=-1, keepdim=True)
         return probs.permute(1, 0, 2).contiguous()  # (n, 3, n_symbols)

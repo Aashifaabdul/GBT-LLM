@@ -93,16 +93,54 @@ class RangeDecoder:
 
 
 def probs_to_freqs(probs, total=TOTAL_FREQ):
-    """Convert a probability array to integer frequencies summing exactly to `total`,
-    with every symbol guaranteed freq >= 1 (so nothing is ever unencodable)."""
-    freqs = np.maximum(1, np.round(np.asarray(probs) * total)).astype(np.int64)
-    diff = total - int(freqs.sum())
-    idx = int(np.argmax(freqs))
-    freqs[idx] += diff
-    if freqs[idx] < 1:
-        # extremely unlikely with reasonable probs, but keep it safe
-        freqs[idx] = 1
-        freqs[np.argmax(freqs)] -= (1 - freqs[idx])
+    """Convert a probability array to integer frequencies summing EXACTLY to
+    `total`, with every symbol guaranteed freq >= 1 (so nothing is ever
+    unencodable). RangeEncoder/RangeDecoder both hard-code `tot_freq=total`
+    (they never read freqs.sum() themselves) -- if the returned freqs don't
+    sum to exactly `total`, the encoder's cumulative-frequency intervals and
+    the decoder's `range // tot_freq` division silently disagree, and the
+    decoder starts returning wrong symbols from the very first call. This is
+    a real, confirmed-reproduced bug fix, not defensive-only code: with a
+    wide symbol_range (this project uses up to 4401 symbols, to cover
+    near-lossless DC coefficients) and a highly-peaked distribution (e.g. a
+    fine-quantization DC-term Laplace distribution), the OLD implementation
+    (round each bin independently to >=1, then patch only the single largest
+    bin to absorb the total rounding error) could need a correction bigger
+    than the largest bin itself -- confirmed: a 4401-symbol Laplace(scale=3)
+    distribution rounded to a pre-correction sum of 20718 against a budget
+    of 16384 (a 4334 excess from ~4356 near-zero bins each floored up to 1),
+    while the largest bin only held 2704 -- the old single-bin patch then
+    went negative, silently clamped to 1, and left freqs summing to 18015,
+    not 16384. Decoding under a mismatched total desynced on symbol one.
+
+    Fixed via the standard "largest remainder" apportionment method: reserve
+    exactly 1 unit for every symbol up front (guaranteeing freq>=1 for all
+    n <= total symbols), then distribute the remaining budget across bins
+    proportionally to probability, rounding down and handing the leftover
+    few units to the bins with the largest fractional remainder. This always
+    produces freqs.sum() == total exactly, for any probability distribution,
+    as long as n_symbols <= total.
+    """
+    probs = np.asarray(probs, dtype=np.float64)
+    n = len(probs)
+    if n > total:
+        raise ValueError(
+            f"probs_to_freqs: {n} symbols cannot each get freq>=1 out of a "
+            f"total budget of only {total} -- narrow the symbol range or "
+            f"raise `total` (TOTAL_FREQ)."
+        )
+    remaining = total - n  # budget left after reserving 1 unit per symbol
+    ideal = probs * remaining
+    base = np.floor(ideal).astype(np.int64)
+    leftover = remaining - int(base.sum())
+    if leftover > 0:
+        frac = ideal - base
+        # hand the few leftover units to the bins closest to their next
+        # integer (largest fractional remainder) -- stable sort so ties
+        # resolve deterministically (same on encoder and decoder)
+        order = np.argsort(-frac, kind="stable")
+        base[order[:leftover]] += 1
+    freqs = 1 + base
     cum = np.concatenate([[0], np.cumsum(freqs)])
     return freqs, cum
 

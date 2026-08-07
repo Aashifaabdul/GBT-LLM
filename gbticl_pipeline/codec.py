@@ -35,12 +35,12 @@ once GBTICLPredictor/CoeffPredictor are trained models instead of placeholders.
 
 import torch
 
-from .graph_model import UniformGBTICL
+from .graph_model import UniformGBTICL, GBTICLMetaLearner
 from .graph_utils import build_laplacian, eigendecompose
 from .gft import forward_gft, inverse_gft
 from .quantization import quantize, dequantize
-from .coeff_model import LaplaceCoeffModel
-from .context import get_context, get_block, set_block
+from .coeff_model import LaplaceCoeffModel, TinyTransformerCoeffModel
+from .context import get_context, get_block, set_block, get_support_set
 from .range_coder import RangeEncoder, RangeDecoder, encode_symbol, decode_symbol
 from .device_utils import get_device
 
@@ -151,3 +151,217 @@ def decode_image(payload, meta, gbticl_model=None, coeff_model=None, device=None
             set_block(canvas, i, j, block_size, recon_u8)
 
     return canvas.cpu().numpy()  # host boundary at the very end, for PIL/PSNR/etc.
+
+
+# ==============================================================================
+# Video mode: encode_video/decode_video loop encode_image/decode_image's exact
+# per-block body over a sequence of frames, threading the previous frame's
+# FULL RECONSTRUCTION into the next frame's block processing for temporal
+# conditioning:
+#   - GBTICLMetaLearner gets a real spatiotemporal support set (context.py's
+#     get_support_set: spatial neighbours in the current frame + temporal
+#     neighbours in the previous frame) instead of the all-missing support
+#     the plain encode_image path falls back to.
+#   - TinyTransformerCoeffModel gets the previous frame's co-located block's
+#     decoded coefficients as extra conditioning (see its class docstring's
+#     cross-frame note and known limitation).
+# Frame 0 has no previous frame (prev_canvas=None): GBTICLMetaLearner's
+# temporal support slots are simply marked invalid (falls back to its
+# learned "missing support" embedding) and TinyTransformerCoeffModel gets
+# temporal_values=None (falls back to its learned no_temporal embedding) --
+# both models degrade to spatial-only/no-temporal, not a crash or special
+# case, so frame 0 is a real, load-bearing regression anchor: comparing it
+# to encode_image's own output on the same frame is exactly how
+# tests/test_codec_video_roundtrip.py checks this wiring is correct.
+#
+# Other models (UniformGBTICL, ContextGradientGBTICL, GBTICLNet,
+# LaplaceCoeffModel) don't accept a support set / temporal_values at all --
+# encode_video/decode_video duck-type via isinstance() and simply don't pass
+# those arguments for them, so this function works unmodified as a video
+# loop for every model this project ships, not just the meta-learner.
+#
+# Each frame gets its own independent range-coder payload (simplest; matches
+# how run_dataset_pipeline.py already reports per-frame metrics) rather than
+# one concatenated bitstream across the whole sequence.
+# ==============================================================================
+
+def _supports_context_set(gbticl_model):
+    return isinstance(gbticl_model, GBTICLMetaLearner)
+
+
+def _supports_temporal_coeffs(coeff_model):
+    return isinstance(coeff_model, TinyTransformerCoeffModel)
+
+
+def encode_video(frames_np, block_size=8, quant_step=8.0,
+                  gbticl_model=None, coeff_model=None, symbol_range=(-2200, 2200),
+                  device=None):
+    """
+    Args:
+        frames_np: (T, H, W, 3) uint8 array, or a list/sequence of (H, W, 3)
+                   uint8 arrays, all the same shape.
+        (all other args: same as encode_image)
+
+    Returns:
+        payloads: list of T bytes objects, one per frame
+        metas: list of T meta dicts, one per frame (same shape as
+               encode_image's meta, so evaluate.py/run_dataset_pipeline.py
+               can treat each frame exactly as they already do for images)
+    """
+    device = device or get_device()
+    gbticl_model = (gbticl_model or UniformGBTICL()).to(device)
+    coeff_model = (coeff_model or LaplaceCoeffModel()).to(device)
+    use_support = _supports_context_set(gbticl_model)
+    use_temporal_coeffs = _supports_temporal_coeffs(coeff_model)
+
+    payloads, metas = [], []
+    prev_canvas = None
+    prev_q = None  # (n_bh, n_bw, n, 3) int64, this frame's decoded coefficients, becomes next frame's temporal signal
+
+    for frame_np in frames_np:
+        H, W, _ = frame_np.shape
+        assert H % block_size == 0 and W % block_size == 0, \
+            "frame dimensions must be multiples of block_size for this prototype"
+
+        rgb = torch.as_tensor(frame_np, device=device)
+        n_bh, n_bw = H // block_size, W // block_size
+        canvas = torch.zeros((H, W, 3), dtype=torch.uint8, device=device)
+        encoder = RangeEncoder()
+        n_symbols = 0
+        n = block_size * block_size
+        this_q = torch.zeros((n_bh, n_bw, n, 3), dtype=torch.int64, device=device)
+
+        for i in range(n_bh):
+            for j in range(n_bw):
+                top, left, valid_top, valid_left = get_context(canvas, i, j, block_size)
+
+                if use_support:
+                    support = get_support_set(canvas, prev_canvas, i, j, block_size)
+                    weights = gbticl_model.predict_edge_weights(
+                        top, left, valid_top, valid_left, block_size, support=support
+                    )
+                else:
+                    weights = gbticl_model.predict_edge_weights(top, left, valid_top, valid_left, block_size)
+
+                L = build_laplacian(weights, block_size, device=device)
+                eigvals, U = eigendecompose(L)
+
+                block = get_block(rgb, i, j, block_size)
+                coeffs = forward_gft(block, U)
+                q = quantize(coeffs, quant_step)
+
+                temporal_values = None
+                if use_temporal_coeffs and prev_q is not None:
+                    temporal_values = prev_q[i, j].to(torch.float32)  # (n, 3)
+
+                probs_all = coeff_model.precompute_encode_probs(
+                    eigvals, q, symbol_range,
+                    **({"temporal_values": temporal_values} if use_temporal_coeffs else {}),
+                )  # (n, 3, n_symbols)
+
+                for k in range(n):
+                    for ch in range(3):
+                        probs = probs_all[k, ch]
+                        val = int(q[k, ch].item())
+                        sym_idx = val - symbol_range[0]
+                        assert 0 <= sym_idx <= (symbol_range[1] - symbol_range[0]), (
+                            f"coefficient {val} out of symbol_range {symbol_range} "
+                            f"at block ({i},{j}) k={k} ch={ch} -- widen symbol_range or quant_step"
+                        )
+                        encode_symbol(encoder, probs.detach().cpu().numpy(), sym_idx)
+                        n_symbols += 1
+
+                this_q[i, j] = q
+
+                dq = dequantize(q, quant_step)
+                recon = inverse_gft(dq, U, block_size)
+                recon_u8 = torch.clamp(torch.round(recon), 0, 255).to(torch.uint8)
+                set_block(canvas, i, j, block_size, recon_u8)
+
+        payload = encoder.finish()
+        meta = dict(H=H, W=W, block_size=block_size, quant_step=quant_step,
+                    symbol_range=symbol_range, n_symbols_coded=n_symbols, device=str(device))
+        payloads.append(payload)
+        metas.append(meta)
+
+        prev_canvas = canvas.clone()
+        prev_q = this_q
+
+    return payloads, metas
+
+
+def decode_video(payloads, metas, gbticl_model=None, coeff_model=None, device=None):
+    """Mirrors encode_video exactly, reading from each frame's bitstream
+    instead of already knowing the coefficients, but computing
+    GBT-ICL/eigendecomposition/support-set identically from the same
+    canvas-derived (spatial) and prev_canvas-derived (temporal) context --
+    no graph, probability model, or support-set label is ever transmitted.
+
+    Returns:
+        list of T (H, W, 3) uint8 numpy arrays, one reconstructed frame each
+    """
+    device = device or get_device()
+    gbticl_model = (gbticl_model or UniformGBTICL()).to(device)
+    coeff_model = (coeff_model or LaplaceCoeffModel()).to(device)
+    use_support = _supports_context_set(gbticl_model)
+    use_temporal_coeffs = _supports_temporal_coeffs(coeff_model)
+
+    recon_frames = []
+    prev_canvas = None
+    prev_q = None
+
+    for payload, meta in zip(payloads, metas):
+        H, W = meta["H"], meta["W"]
+        block_size = meta["block_size"]
+        quant_step = meta["quant_step"]
+        symbol_range = meta["symbol_range"]
+        n_bh, n_bw = H // block_size, W // block_size
+        n = block_size * block_size
+
+        canvas = torch.zeros((H, W, 3), dtype=torch.uint8, device=device)
+        decoder = RangeDecoder(payload)
+        this_q = torch.zeros((n_bh, n_bw, n, 3), dtype=torch.int64, device=device)
+
+        for i in range(n_bh):
+            for j in range(n_bw):
+                top, left, valid_top, valid_left = get_context(canvas, i, j, block_size)
+
+                if use_support:
+                    support = get_support_set(canvas, prev_canvas, i, j, block_size)
+                    weights = gbticl_model.predict_edge_weights(
+                        top, left, valid_top, valid_left, block_size, support=support
+                    )
+                else:
+                    weights = gbticl_model.predict_edge_weights(top, left, valid_top, valid_left, block_size)
+
+                L = build_laplacian(weights, block_size, device=device)
+                eigvals, U = eigendecompose(L)
+
+                temporal_values = None
+                if use_temporal_coeffs and prev_q is not None:
+                    temporal_values = prev_q[i, j].to(torch.float32)  # (n, 3)
+
+                q = torch.zeros((n, 3), dtype=torch.int64, device=device)
+                history = {0: [], 1: [], 2: []}
+                for k in range(n):
+                    for ch in range(3):
+                        temp_ch = temporal_values[:, ch] if temporal_values is not None else None
+                        kwargs = {"temporal_values": temp_ch} if use_temporal_coeffs else {}
+                        probs = coeff_model.symbol_probs(eigvals, k, history[ch], symbol_range, **kwargs)
+                        sym_idx = decode_symbol(decoder, probs.detach().cpu().numpy())
+                        val = sym_idx + symbol_range[0]
+                        q[k, ch] = val
+                        history[ch].append(val)
+
+                this_q[i, j] = q
+
+                dq = dequantize(q, quant_step)
+                recon = inverse_gft(dq, U, block_size)
+                recon_u8 = torch.clamp(torch.round(recon), 0, 255).to(torch.uint8)
+                set_block(canvas, i, j, block_size, recon_u8)
+
+        recon_frames.append(canvas.cpu().numpy())
+        prev_canvas = canvas.clone()
+        prev_q = this_q
+
+    return recon_frames
