@@ -70,7 +70,7 @@ except ImportError as e:
 
 from PIL import Image
 
-from gbticl_pipeline.device_utils import get_device
+from gbticl_pipeline.device_utils import get_device, load_state_dict_relaxed
 from gbticl_pipeline.codec import encode_image, decode_image, encode_video, decode_video
 from gbticl_pipeline.evaluate import psnr, ssim, bits_per_pixel
 from gbticl_pipeline.colour import rgb_to_ycbcr, ycbcr_to_rgb
@@ -139,11 +139,11 @@ def load_models(checkpoint_path, device):
     quant_step = ckpt.get("quant_step", DEFAULT_QUANT_STEP)
 
     gbticl_model = GBTICLNet(block_size=block_size).to(device)
-    gbticl_model.load_state_dict(ckpt["gbticl_net"])
+    load_state_dict_relaxed(gbticl_model, ckpt["gbticl_net"], "GBTICLNet")
     gbticl_model.eval()
 
     coeff_model = TinyTransformerCoeffModel(block_size=block_size, symbol_range=symbol_range).to(device)
-    coeff_model.load_state_dict(ckpt["coeff_net"])
+    load_state_dict_relaxed(coeff_model, ckpt["coeff_net"], "TinyTransformerCoeffModel")
     coeff_model.eval()
 
     print(f"loaded trained checkpoint {checkpoint_path} "
@@ -160,7 +160,7 @@ def load_gbticl_for_ablation(gbticl_checkpoint, device):
     model_type = ckpt.get("gbticl_model_type", "net")
     block_size = ckpt.get("block_size", BLOCK_SIZE)
     model = (GBTICLMetaLearner if model_type == "metalearner" else GBTICLNet)(block_size=block_size).to(device)
-    model.load_state_dict(ckpt["gbticl_net"])
+    load_state_dict_relaxed(model, ckpt["gbticl_net"], model_type)
     model.eval()
     print(f"loaded GBT-ICL ({model_type}) from {gbticl_checkpoint} (epoch {ckpt.get('epoch', '?')})")
     return model
@@ -179,7 +179,7 @@ def load_coeff_for_ablation(coeff_checkpoint, base_model_name, symbol_range, dev
                                   symbol_range=symbol_range).to(device)
     else:
         model = TinyTransformerCoeffModel(block_size=block_size, symbol_range=symbol_range).to(device)
-    model.load_state_dict(ckpt["coeff_net"])
+    load_state_dict_relaxed(model, ckpt["coeff_net"], coeff_type)
     model.eval()
     print(f"loaded coefficient model ({coeff_type}) from {coeff_checkpoint}")
     return model

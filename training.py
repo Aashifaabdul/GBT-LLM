@@ -118,7 +118,7 @@ except ImportError as e:
 
 from PIL import Image
 
-from gbticl_pipeline.device_utils import get_device
+from gbticl_pipeline.device_utils import get_device, load_state_dict_relaxed
 from gbticl_pipeline.graph_model import (
     GBTICLNet, GBTICLMetaLearner, edge_list, context_features, reference_edge_weights_batch,
 )
@@ -508,7 +508,7 @@ def main():
 
     if args.gbticl_checkpoint:
         ckpt = torch.load(script_dir / args.gbticl_checkpoint, map_location=device, weights_only=False)
-        gbticl_net.load_state_dict(ckpt["gbticl_net"])
+        load_state_dict_relaxed(gbticl_net, ckpt["gbticl_net"], args.gbticl_model)
         print(f"loaded GBT-ICL weights from {args.gbticl_checkpoint} (epoch {ckpt.get('epoch', '?')})")
 
     if args.freeze_gbticl:
@@ -528,7 +528,7 @@ def main():
 
     if coeff_net is not None and args.coeff_checkpoint:
         ckpt = torch.load(script_dir / args.coeff_checkpoint, map_location=device, weights_only=False)
-        coeff_net.load_state_dict(ckpt["coeff_net"])
+        load_state_dict_relaxed(coeff_net, ckpt["coeff_net"], args.coeff_model)
         print(f"loaded coefficient-model weights from {args.coeff_checkpoint}")
 
     # ---------------- build dataset/loader ----------------
