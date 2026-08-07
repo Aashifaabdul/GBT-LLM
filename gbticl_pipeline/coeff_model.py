@@ -514,22 +514,53 @@ class HFLoRACoeffModel(CoeffPredictor):
             temp_emb = self.no_temporal.to(val_emb.dtype).expand(n_pos, -1)
         return (val_emb + eig_emb + pos + temp_emb).unsqueeze(0)  # (1, n_pos, d)
 
+    def _embed_positions_batched(self, eigvals, prev_values, device, temporal_values=None):
+        """Real-batch counterpart of _embed_positions, always pos_start=0
+        (full-sequence only): eigvals, prev_values: (B, n_pos) ->
+        (B, n_pos, d_model). Used by forward_sequence's actual training path
+        (training.py's train_step_metalearner passes a real (B*3, n) batch,
+        not a single sequence) -- kept as a separate method rather than
+        overloading _embed_positions with an extra dim-handling branch,
+        since the incremental decode paths (symbol_probs, _cold_start) are
+        deliberately single-sequence and simpler for it."""
+        b, n_pos = eigvals.shape
+        val_emb = self.value_embed(self._value_feat(prev_values))  # (B,n_pos,d)
+        val_emb = val_emb.clone()
+        val_emb[:, 0] = self.bos
+        eig_emb = self.eigval_embed(eigvals.to(torch.float32).unsqueeze(-1))  # (B,n_pos,d)
+        pos = self.pos_embed(torch.arange(n_pos, device=device)).unsqueeze(0).expand(b, -1, -1)
+        if temporal_values is not None:
+            temp_emb = self.temporal_value_embed(self._value_feat(temporal_values))
+        else:
+            temp_emb = self.no_temporal.to(val_emb.dtype).expand(b, n_pos, -1)
+        return val_emb + eig_emb + pos + temp_emb  # (B, n_pos, d)
+
     def _run_full(self, inputs_embeds):
         """Full-sequence forward pass, no cache -- used by forward_sequence
         (training / encoder-side precompute_encode_probs, teacher-forced,
-        parallel over the whole block/channel in one call)."""
+        parallel over the whole block/channel in one call). Batch-size
+        agnostic: works for (1, n, d) or real (B, n, d) alike."""
         attn = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=inputs_embeds.device)
         out = self.lm(inputs_embeds=inputs_embeds.to(self.lm_dtype), attention_mask=attn)
-        return out.last_hidden_state.to(torch.float32)  # (1, n_pos, d)
+        return out.last_hidden_state.to(torch.float32)  # (B, n_pos, d)
 
     def forward_sequence(self, eigvals, true_values, temporal_values=None):
+        """eigvals, true_values: (n,) for one sequence, or (B, n) for a real
+        batch (training.py's train_step_metalearner always uses the latter).
+        Returns logits: (n, n_symbols) or (B, n, n_symbols) matching input rank."""
+        squeeze = eigvals.dim() == 1
+        if squeeze:
+            eigvals, true_values = eigvals.unsqueeze(0), true_values.unsqueeze(0)
+            if temporal_values is not None:
+                temporal_values = temporal_values.unsqueeze(0)
         device = eigvals.device
-        n = eigvals.shape[0]
-        prev = torch.zeros(n, device=device, dtype=torch.float32)
-        prev[1:] = true_values[:-1].to(torch.float32)
-        embeds = self._embed_positions(eigvals, prev, 0, device, temporal_values=temporal_values)
-        hidden = self._run_full(embeds)
-        return self.out_proj(hidden[0])
+        b, n = eigvals.shape
+        prev = torch.zeros(b, n, device=device, dtype=torch.float32)
+        prev[:, 1:] = true_values[:, :-1].to(torch.float32)
+        embeds = self._embed_positions_batched(eigvals, prev, device, temporal_values=temporal_values)
+        hidden = self._run_full(embeds)  # (B, n, d)
+        logits = self.out_proj(hidden)   # (B, n, n_symbols)
+        return logits.squeeze(0) if squeeze else logits
 
     def _evict_cache_if_full(self):
         if len(self._kv_caches) > self._MAX_CACHE_SLOTS:

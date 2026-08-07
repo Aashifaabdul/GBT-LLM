@@ -211,7 +211,7 @@ def reassemble_video(frame_dir, out_mp4, fps):
     make_concat_file(frame_paths, list_path, fps)
     cmd = [
         "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_path),
-        "-vsync", "vfr", "-pix_fmt", "yuv420p", str(out_mp4),
+        "-fps_mode", "vfr", "-pix_fmt", "yuv420p", str(out_mp4),
     ]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True)

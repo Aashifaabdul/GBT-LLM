@@ -1,4 +1,46 @@
 """
+Differentiable training of GBT-ICL and the coefficient predictor, against
+real extracted video frames.
+
+======================= STAGED TRAINING (--gbticl-model, --coeff-model,
+======================= --freeze-gbticl) =====================================
+The primary GBT-ICL model is now GBTICLMetaLearner (graph_model.py) --a
+few-shot in-context meta-learner, not the older context-conditional
+GBTICLNet regressor (kept as an explicit ablation baseline). Recommended
+training order, run as three separate invocations of this script (not one
+joint end-to-end run) -- see the plan's rationale: the meta-learner's
+predicted eigenbasis keeps shifting through early training, so a jointly
+trained coefficient predictor chases a moving target and confounds
+debugging if loss diverges; it's standard practice in learned-compression
+research to pretrain/verify components separately before any joint
+fine-tuning.
+
+  Stage A -- meta-train GBTICLMetaLearner alone, paired with the frozen
+  LaplaceCoeffModel baseline (no coefficient-model parameters to update):
+      python training.py --gbticl-model metalearner --coeff-model none \
+          --lambda-rate 0.01 --epochs 30 --out checkpoints/stageA.pt
+
+  Stage B -- freeze the Stage-A GBT-ICL checkpoint, train the coefficient
+  predictor (TinyTransformerCoeffModel or HFLoRACoeffModel) against it:
+      python training.py --gbticl-model metalearner --freeze-gbticl \
+          --gbticl-checkpoint checkpoints/stageA.pt \
+          --coeff-model hf_lora --epochs 10 --out checkpoints/stageB.pt
+
+  Stage C (optional) -- short joint fine-tune of both at a low --lr, once
+  each is individually stable:
+      python training.py --gbticl-model metalearner --coeff-model hf_lora \
+          --gbticl-checkpoint checkpoints/stageA.pt \
+          --coeff-checkpoint checkpoints/stageB.pt \
+          --lr 3e-5 --epochs 5 --out checkpoints/stageC.pt
+
+`--gbticl-model net` reproduces the original (pre-meta-learner) joint
+GBTICLNet+coefficient-model training exactly, for retraining the
+context-conditional-regressor ablation baseline.
+================================================================================
+
+Below: the original (Stage-A-equivalent, GBTICLNet-specific) design notes,
+still accurate for that code path.
+
 Joint, differentiable training of GBTICLNet (the real GBT-ICL model) and
 TinyTransformerCoeffModel (the real LLM-style coefficient predictor),
 end to end, against real extracted video frames.
@@ -77,10 +119,13 @@ except ImportError as e:
 from PIL import Image
 
 from gbticl_pipeline.device_utils import get_device
-from gbticl_pipeline.graph_model import GBTICLNet, edge_list
+from gbticl_pipeline.graph_model import (
+    GBTICLNet, GBTICLMetaLearner, edge_list, context_features, reference_edge_weights_batch,
+)
 from gbticl_pipeline.graph_utils import build_laplacian_batch, eigendecompose
 from gbticl_pipeline.gft import forward_gft_batch, inverse_gft_batch
-from gbticl_pipeline.coeff_model import TinyTransformerCoeffModel
+from gbticl_pipeline.coeff_model import TinyTransformerCoeffModel, HFLoRACoeffModel
+from gbticl_pipeline.context import get_context, get_block, get_support_set, N_SUPPORT
 
 BLOCK_SIZE = 8
 PAD_VALUE = 128
@@ -144,6 +189,83 @@ class BlockContextDataset(Dataset):
         )
 
 
+class MetaEpisodeDataset(Dataset):
+    """
+    Episodic training data for GBTICLMetaLearner: each item is one "task" --
+    a query block plus its full spatiotemporal support set, built with the
+    SAME get_support_set()/reference_edge_weights() functions the actual
+    codec uses at inference (context.py, graph_model.py) -- not a
+    reimplementation, so training and inference can never architecturally
+    drift apart.
+
+    Reuses the same "true pixels stand in for decoded reconstruction"
+    approximation BlockContextDataset already documents (valid because a
+    working codec's reconstruction closely approximates the true pixels,
+    exactly so at quant_step -> 0). For TEMPORAL support specifically, this
+    also reuses real cross-frame structure: `sequences` groups frame paths
+    by video sequence in time order, so frame t's episodes get REAL
+    previous-frame support from frame t-1 of the same sequence (not a
+    synthetic/random previous frame) -- frame 0 of each sequence simply gets
+    prev_canvas=None, exactly like encode_video's first frame.
+
+    All frames for the given sequences are loaded into memory up front
+    (this project's frame counts -- ~30 frames x ~2 sequences x 1920x1080x3
+    uint8 -- are a few hundred MB, trivial for a 16GB-RAM machine).
+    """
+
+    def __init__(self, sequences, block_size=8, samples_per_frame=1000, seed=0):
+        """
+        Args:
+            sequences: dict[str, List[Path]] -- frame paths grouped by
+                sequence name, each list already sorted by frame index/time.
+        """
+        self.block_size = block_size
+        self.frames = {}  # seq_name -> list of (H, W, 3) uint8 numpy arrays, in time order
+        self.items = []   # list of (seq_name, frame_idx, i, j)
+        rng = np.random.default_rng(seed)
+
+        for seq_name, paths in sequences.items():
+            imgs = [np.array(Image.open(p).convert("RGB")) for p in paths]
+            self.frames[seq_name] = imgs
+            for t, img in enumerate(imgs):
+                h, w = img.shape[:2]
+                n_bh, n_bw = h // block_size, w // block_size
+                all_idx = [(i, j) for i in range(n_bh) for j in range(n_bw)]
+                n_take = min(samples_per_frame, len(all_idx))
+                chosen = rng.choice(len(all_idx), size=n_take, replace=False)
+                for c in chosen:
+                    i, j = all_idx[c]
+                    self.items.append((seq_name, t, i, j))
+
+        n_frames = sum(len(v) for v in self.frames.values())
+        print(f"MetaEpisodeDataset: {len(self.items)} sampled episodes across "
+              f"{n_frames} frames, {len(sequences)} sequence(s)")
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, idx):
+        seq_name, t, i, j = self.items[idx]
+        img = self.frames[seq_name][t]
+        prev_img = self.frames[seq_name][t - 1] if t > 0 else None
+
+        canvas = torch.from_numpy(img)
+        prev_canvas = torch.from_numpy(prev_img) if prev_img is not None else None
+
+        top, left, valid_top, valid_left = get_context(canvas, i, j, self.block_size)
+        block = get_block(canvas, i, j, self.block_size)
+        support = get_support_set(canvas, prev_canvas, i, j, self.block_size)
+
+        return dict(
+            top=top, left=left,
+            valid_top=torch.tensor(valid_top), valid_left=torch.tensor(valid_left),
+            block=block,
+            support_top=support["top"], support_left=support["left"],
+            support_valid_top=support["valid_top"], support_valid_left=support["valid_left"],
+            support_block=support["block"], support_valid=support["valid"],
+        )
+
+
 # --------------------------------------------------------------------------
 # Training step
 # --------------------------------------------------------------------------
@@ -198,10 +320,137 @@ def train_step(gbticl_net, coeff_net, batch, quant_step, symbol_range, lambda_ra
     return loss, distortion.item(), rate_bits.item()
 
 
+def train_step_metalearner(gbticl_net, coeff_net, batch, quant_step, symbol_range, lambda_rate, device):
+    """
+    Episodic meta-training step for GBTICLMetaLearner. Mirrors train_step()'s
+    distortion/rate loss exactly (same STE quantization, same
+    build_laplacian_batch/eigendecompose/forward_gft_batch pipeline) --
+    only the graph-prediction step differs: GBTICLMetaLearner's cross-
+    attention forward pass over the batch's support sets, instead of
+    GBTICLNet's context-only MLP forward pass.
+
+    coeff_net: pass a trainable CoeffPredictor (TinyTransformerCoeffModel /
+        HFLoRACoeffModel) for Stage C's joint fine-tune. Pass None for Stage
+        A (GBT-ICL meta-training alone) -- there is no trainable coefficient
+        model yet at that point, so the rate term instead uses
+        LaplaceCoeffModel's closed-form, history-free probability formula as
+        a fixed (but still eigval-differentiable, hence gbticl_net-
+        differentiable) rate proxy.
+    """
+    top = batch["top"].to(device)
+    left = batch["left"].to(device)
+    valid_top = batch["valid_top"].to(device)
+    valid_left = batch["valid_left"].to(device)
+    block = batch["block"].to(device)
+    support_top = batch["support_top"].to(device)
+    support_left = batch["support_left"].to(device)
+    support_valid_top = batch["support_valid_top"].to(device)
+    support_valid_left = batch["support_valid_left"].to(device)
+    support_block = batch["support_block"].to(device)
+    support_valid = batch["support_valid"].to(device)
+
+    bs = gbticl_net.block_size
+    b, k = support_top.shape[0], support_top.shape[1]
+
+    query_feats = context_features(top, left, valid_top, valid_left, bs, device)  # (B, ctx_dim)
+    support_ctx_feats = context_features(
+        support_top.reshape(b * k, bs, 3), support_left.reshape(b * k, bs, 3),
+        support_valid_top.reshape(b * k), support_valid_left.reshape(b * k), bs, device,
+    ).reshape(b, k, -1)
+    support_weights = reference_edge_weights_batch(
+        support_block.reshape(b * k, bs, bs, 3), bs
+    ).reshape(b, k, -1)
+
+    logits_w = gbticl_net.forward(query_feats, support_ctx_feats, support_weights, support_valid)
+    weights = gbticl_net.to_weights(logits_w)  # (B, n_edges)
+
+    L = build_laplacian_batch(weights, bs)       # (B, n, n)
+    eigvals, U = eigendecompose(L)                # (B,n), (B,n,n)
+    coeffs = forward_gft_batch(block, U)          # (B, n, 3) float64
+
+    coeffs_scaled = coeffs / quant_step
+    q_hard = torch.round(coeffs_scaled)
+    q_ste = coeffs_scaled + (q_hard - coeffs_scaled).detach()
+
+    recon = inverse_gft_batch(q_ste * quant_step, U, bs)
+    distortion = F.mse_loss(recon, block.to(torch.float64))
+
+    lo, hi = symbol_range
+    n_symbols = hi - lo + 1
+    n = eigvals.shape[-1]
+    q_int = torch.clamp(q_hard, lo, hi).to(torch.int64)   # (B, n, 3)
+    target_idx = q_int - lo
+
+    if coeff_net is not None:
+        eigvals_rep = eigvals.unsqueeze(1).expand(-1, 3, -1).reshape(b * 3, n)
+        true_vals_rep = q_int.permute(0, 2, 1).reshape(b * 3, n).to(torch.float32)
+        target_rep = target_idx.permute(0, 2, 1).reshape(b * 3, n)
+        coeff_logits = coeff_net.forward_sequence(eigvals_rep, true_vals_rep)  # (B*3, n, n_symbols)
+        ce_nats = F.cross_entropy(
+            coeff_logits.reshape(-1, n_symbols), target_rep.reshape(-1), reduction="mean"
+        )
+        rate_bits = ce_nats / np.log(2.0)
+    else:
+        lap = train_step_metalearner._lap_cache
+        if lap is None or lap._device_anchor.device != device:
+            from gbticl_pipeline.coeff_model import LaplaceCoeffModel
+            lap = LaplaceCoeffModel().to(device)
+            train_step_metalearner._lap_cache = lap
+        eigvals_flat = eigvals.unsqueeze(1).expand(-1, 3, -1).reshape(-1)          # (B*3*n,)
+        probs_flat = lap.batch_symbol_probs(eigvals_flat, symbol_range)            # (B*3*n, n_symbols)
+        probs = probs_flat.reshape(b * 3, n, n_symbols)
+        target_rep = target_idx.permute(0, 2, 1).reshape(b * 3, n).clamp(0, n_symbols - 1)
+        target_probs = torch.gather(probs, -1, target_rep.unsqueeze(-1)).squeeze(-1)
+        nll_nats = -torch.log(target_probs.clamp_min(1e-12)).mean()
+        rate_bits = nll_nats / np.log(2.0)
+
+    loss = distortion + lambda_rate * rate_bits
+    return loss, distortion.item(), rate_bits.item()
+
+
+train_step_metalearner._lap_cache = None  # lazily-built, device-checked LaplaceCoeffModel for Stage A's rate proxy
+
+
+def _group_by_sequence(frame_paths):
+    """Groups frame paths by the sequence subdirectory they live under
+    (Beauty/frames/frameNNNN.png -> sequence "Beauty"), sorted by filename
+    (== frame index, since gbticl_frame_prep.py names them frameNNNN.png)
+    within each sequence -- MetaEpisodeDataset needs this time ordering for
+    real temporal (t-1 -> t) support pairs."""
+    groups = {}
+    for p in frame_paths:
+        seq_name = p.parent.parent.name if p.parent.name == "frames" else p.parent.name
+        groups.setdefault(seq_name, []).append(p)
+    for seq_name in groups:
+        groups[seq_name] = sorted(groups[seq_name])
+    return groups
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--frames-dirs", nargs="+", default=["Beauty/frames", "HoneyBee/frames"],
                      help="One or more directories of extracted PNG frames.")
+    ap.add_argument("--gbticl-model", choices=["metalearner", "net"], default="metalearner",
+                     help="metalearner: GBTICLMetaLearner, the primary few-shot in-context model "
+                          "(episodic training with real spatiotemporal support sets). "
+                          "net: GBTICLNet, the context-conditional-regressor ablation baseline "
+                          "(original joint-training behaviour, unchanged).")
+    ap.add_argument("--coeff-model", choices=["tiny", "hf_lora", "none"], default="tiny",
+                     help="tiny: TinyTransformerCoeffModel (from-scratch). hf_lora: HFLoRACoeffModel "
+                          "(real pretrained LLM + LoRA). none: no trainable coefficient model -- only "
+                          "valid with --gbticl-model metalearner (Stage A: GBT-ICL alone, paired with "
+                          "a closed-form rate proxy -- see train_step_metalearner's docstring).")
+    ap.add_argument("--base-model-name", type=str, default="distilgpt2",
+                     help="Base pretrained LM for --coeff-model hf_lora.")
+    ap.add_argument("--freeze-gbticl", action="store_true",
+                     help="Freeze GBT-ICL (loaded from --gbticl-checkpoint) and train only the "
+                          "coefficient model -- Stage B.")
+    ap.add_argument("--gbticl-checkpoint", type=str, default=None,
+                     help="Initialize GBT-ICL from this checkpoint (required with --freeze-gbticl; "
+                          "optional otherwise, e.g. Stage C's joint fine-tune starting point).")
+    ap.add_argument("--coeff-checkpoint", type=str, default=None,
+                     help="Initialize the coefficient model from this checkpoint (e.g. Stage C "
+                          "continuing from a Stage B checkpoint).")
     ap.add_argument("--samples-per-frame", type=int, default=3000)
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--batch-size", type=int, default=64)
@@ -216,20 +465,29 @@ def main():
                           "values to trace out a rate-distortion curve for your results section.")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", type=str, default="checkpoints/gbticl_ckpt.pt")
-    ap.add_argument("--num-workers", type=int, default=2,
-                     help="DataLoader worker processes. 0 = load in the main process (slower).")
+    ap.add_argument("--num-workers", type=int, default=0,
+                     help="DataLoader worker processes. 0 = load in the main process. Note: "
+                          "MetaEpisodeDataset preloads all frames as numpy arrays in the main "
+                          "process and __getitem__ only does cheap tensor slicing, so extra "
+                          "workers help less here than they did for BlockContextDataset.")
     ap.add_argument("--log-every", type=int, default=20,
                      help="Print running loss every N batches -- without this, nothing prints "
                           "until a full epoch (thousands of batches) finishes, which looks like "
                           "a hang even when training is progressing normally.")
     args = ap.parse_args()
 
+    if args.coeff_model == "none" and args.gbticl_model != "metalearner":
+        raise SystemExit("--coeff-model none is only valid with --gbticl-model metalearner (Stage A)")
+    if args.freeze_gbticl and not args.gbticl_checkpoint:
+        raise SystemExit("--freeze-gbticl requires --gbticl-checkpoint")
+
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
     device = get_device()
-    print(f"training on device: {device}")
+    print(f"training on device: {device}  gbticl-model={args.gbticl_model}  coeff-model={args.coeff_model}"
+          f"{'  [gbticl FROZEN]' if args.freeze_gbticl else ''}")
 
     script_dir = Path(__file__).resolve().parent
     frame_paths = []
@@ -240,7 +498,48 @@ def main():
         raise SystemExit(f"No PNG frames found under {args.frames_dirs} (resolved against {script_dir})")
     print(f"found {len(frame_paths)} frames")
 
-    dataset = BlockContextDataset(frame_paths, BLOCK_SIZE, args.samples_per_frame, args.seed)
+    symbol_range = (args.symbol_lo, args.symbol_hi)
+
+    # ---------------- build GBT-ICL model ----------------
+    if args.gbticl_model == "metalearner":
+        gbticl_net = GBTICLMetaLearner(block_size=BLOCK_SIZE).to(device)
+    else:
+        gbticl_net = GBTICLNet(block_size=BLOCK_SIZE).to(device)
+
+    if args.gbticl_checkpoint:
+        ckpt = torch.load(script_dir / args.gbticl_checkpoint, map_location=device, weights_only=False)
+        gbticl_net.load_state_dict(ckpt["gbticl_net"])
+        print(f"loaded GBT-ICL weights from {args.gbticl_checkpoint} (epoch {ckpt.get('epoch', '?')})")
+
+    if args.freeze_gbticl:
+        gbticl_net.eval()
+        for p in gbticl_net.parameters():
+            p.requires_grad_(False)
+
+    # ---------------- build coefficient model ----------------
+    if args.coeff_model == "tiny":
+        coeff_net = TinyTransformerCoeffModel(block_size=BLOCK_SIZE, symbol_range=symbol_range).to(device)
+    elif args.coeff_model == "hf_lora":
+        coeff_net = HFLoRACoeffModel(
+            base_model_name=args.base_model_name, block_size=BLOCK_SIZE, symbol_range=symbol_range,
+        ).to(device)
+    else:
+        coeff_net = None
+
+    if coeff_net is not None and args.coeff_checkpoint:
+        ckpt = torch.load(script_dir / args.coeff_checkpoint, map_location=device, weights_only=False)
+        coeff_net.load_state_dict(ckpt["coeff_net"])
+        print(f"loaded coefficient-model weights from {args.coeff_checkpoint}")
+
+    # ---------------- build dataset/loader ----------------
+    if args.gbticl_model == "metalearner":
+        sequences = _group_by_sequence(frame_paths)
+        print(f"grouped into {len(sequences)} sequence(s): "
+              f"{', '.join(f'{k} ({len(v)} frames)' for k, v in sequences.items())}")
+        dataset = MetaEpisodeDataset(sequences, BLOCK_SIZE, args.samples_per_frame, args.seed)
+    else:
+        dataset = BlockContextDataset(frame_paths, BLOCK_SIZE, args.samples_per_frame, args.seed)
+
     steps_per_epoch = len(dataset) // args.batch_size
     print(f"{steps_per_epoch} optimizer steps/epoch x {args.epochs} epochs = "
           f"{steps_per_epoch*args.epochs} total steps. Each step does a batched "
@@ -249,17 +548,21 @@ def main():
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True,
                          num_workers=args.num_workers, pin_memory=(device.type == "cuda"))
 
-    symbol_range = (args.symbol_lo, args.symbol_hi)
-    gbticl_net = GBTICLNet(block_size=BLOCK_SIZE).to(device)
-    coeff_net = TinyTransformerCoeffModel(block_size=BLOCK_SIZE, symbol_range=symbol_range).to(device)
-
-    params = list(gbticl_net.parameters()) + list(coeff_net.parameters())
+    params = [p for p in gbticl_net.parameters() if p.requires_grad]
+    if coeff_net is not None:
+        params += [p for p in coeff_net.parameters() if p.requires_grad]
     n_params = sum(p.numel() for p in params)
-    print(f"total trainable parameters: {n_params:,} "
-          f"(GBTICLNet: {sum(p.numel() for p in gbticl_net.parameters()):,}, "
-          f"TinyTransformerCoeffModel: {sum(p.numel() for p in coeff_net.parameters()):,})")
+    gbticl_label = type(gbticl_net).__name__
+    coeff_label = type(coeff_net).__name__ if coeff_net is not None else "none (Stage A rate proxy)"
+    print(f"total TRAINABLE parameters: {n_params:,} "
+          f"({gbticl_label}: {sum(p.numel() for p in gbticl_net.parameters() if p.requires_grad):,}, "
+          f"{coeff_label}: "
+          f"{sum(p.numel() for p in coeff_net.parameters() if p.requires_grad) if coeff_net is not None else 0:,})")
+    if not params:
+        raise SystemExit("no trainable parameters -- check --freeze-gbticl / --coeff-model combination")
 
     optimizer = torch.optim.Adam(params, lr=args.lr)
+    step_fn = train_step_metalearner if args.gbticl_model == "metalearner" else train_step
 
     out_path = script_dir / args.out
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -273,7 +576,7 @@ def main():
         for batch in loader:
             step_t0 = time.time()
             optimizer.zero_grad()
-            loss, dist, rate = train_step(
+            loss, dist, rate = step_fn(
                 gbticl_net, coeff_net, batch, args.quant_step, symbol_range, args.lambda_rate, device
             )
             loss.backward()
@@ -301,16 +604,22 @@ def main():
               f"[{dt:.1f}s, {n_batches} batches]")
         history.append(dict(epoch=epoch + 1, loss=ep_loss, distortion=ep_dist, rate=ep_rate, seconds=dt))
 
-        torch.save({
+        ckpt_out = {
             "gbticl_net": gbticl_net.state_dict(),
-            "coeff_net": coeff_net.state_dict(),
+            "gbticl_model_type": args.gbticl_model,
             "block_size": BLOCK_SIZE,
             "symbol_range": symbol_range,
             "quant_step": args.quant_step,
             "lambda_rate": args.lambda_rate,
             "epoch": epoch + 1,
             "history": history,
-        }, out_path)
+        }
+        if coeff_net is not None:
+            ckpt_out["coeff_net"] = coeff_net.state_dict()
+            ckpt_out["coeff_model_type"] = args.coeff_model
+            if args.coeff_model == "hf_lora":
+                ckpt_out["base_model_name"] = args.base_model_name
+        torch.save(ckpt_out, out_path)
     print(f"saved checkpoint to {out_path}")
 
 
