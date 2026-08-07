@@ -14,6 +14,11 @@
 checkpoints/*.pt
 results/
 
+# Stray interrupted-write temp files (observed pattern from prior sandbox runs,
+# e.g. ".frame0495_blocks_8x8.npy.FiW3i9", ".frame0537.png.lKmA3l") -- always
+# dotfiles, never something we want tracked
+.frame*
+
 # Python
 __pycache__/
 *.pyc
