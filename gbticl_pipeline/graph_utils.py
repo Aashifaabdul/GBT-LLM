@@ -5,6 +5,7 @@ torch.linalg.eigh is GPU-accelerated automatically when its input is a CUDA
 tensor, no separate GPU code path needed.
 """
 
+import numpy as np
 import torch
 
 from .graph_model import edge_list
@@ -133,4 +134,54 @@ def eigendecompose(L, eps=1e-4, canonicalize_sign=True):
         sign = torch.where(sign == 0, torch.ones_like(sign), sign)  # never zero out a column
         U = U * sign  # broadcasts (..., 1, n) against (..., n, n)
 
+    return eigvals, U
+
+
+_dct_cache = {}
+
+
+def dct_basis_and_eigvals(block_size, device=None):
+    """
+    The 'DCT baseline' ablation: a fixed, content-INDEPENDENT basis, in
+    contrast to GBT-ICL's predicted, content-adaptive one. No graph, no
+    per-block eigendecomposition needed -- computed once (and cached) rather
+    than per block, since it doesn't depend on context at all.
+
+    Not a reimplementation of DCT from scratch: the 2D DCT-II basis is
+    exactly the eigenbasis of the 1D path-graph Laplacian with Neumann
+    (reflecting) boundary conditions, Kronecker-producted across the two
+    spatial axes (a standard graph-signal-processing identity) -- so this
+    function returns an (eigvals, U) pair with EXACTLY the same contract as
+    eigendecompose() above (eigvals ascending float64 starting at 0, U
+    columns orthonormal), letting codec.py drop it in with zero changes to
+    the GFT/quantization/entropy-coding pipeline that follows.
+
+    Returns:
+        eigvals: (n,) float64 tensor, ascending, eigvals[0] == 0
+        U: (n, n) float64 tensor, orthonormal columns (the 2D DCT-II basis,
+           flattened row-major to match edge_list()'s node ordering)
+    """
+    key = block_size
+    if key not in _dct_cache:
+        n = block_size
+        idx = np.arange(n)
+        r = idx.reshape(-1, 1)
+        basis_1d = np.cos(np.pi * (2 * r + 1) * idx / (2 * n)) * np.sqrt(2.0 / n)
+        basis_1d[:, 0] *= 1.0 / np.sqrt(2.0)  # DC-term normalization for orthonormality
+        eigval_1d = 2.0 - 2.0 * np.cos(np.pi * idx / n)  # path-graph Neumann-Laplacian spectrum
+
+        U_2d = np.kron(basis_1d, basis_1d)  # (n^2, n^2), row-major over (row, col) -> matches edge_list()
+        eigval_2d = (eigval_1d.reshape(-1, 1) + eigval_1d.reshape(1, -1)).reshape(-1)  # same kron ordering
+
+        order = np.argsort(eigval_2d)  # ascending, matching eigendecompose()'s contract
+        U_2d = U_2d[:, order]
+        eigval_2d = eigval_2d[order]
+        _dct_cache[key] = (
+            torch.tensor(eigval_2d, dtype=torch.float64),
+            torch.tensor(U_2d, dtype=torch.float64),
+        )
+
+    eigvals, U = _dct_cache[key]
+    if device is not None:
+        eigvals, U = eigvals.to(device), U.to(device)
     return eigvals, U

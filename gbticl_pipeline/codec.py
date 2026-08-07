@@ -36,7 +36,7 @@ once GBTICLPredictor/CoeffPredictor are trained models instead of placeholders.
 import torch
 
 from .graph_model import UniformGBTICL, GBTICLMetaLearner
-from .graph_utils import build_laplacian, eigendecompose
+from .graph_utils import build_laplacian, eigendecompose, dct_basis_and_eigvals
 from .gft import forward_gft, inverse_gft
 from .quantization import quantize, dequantize
 from .coeff_model import LaplaceCoeffModel, TinyTransformerCoeffModel, HFLoRACoeffModel
@@ -47,17 +47,24 @@ from .device_utils import get_device
 
 def encode_image(rgb_np, block_size=8, quant_step=8.0,
                   gbticl_model=None, coeff_model=None, symbol_range=(-2200, 2200),
-                  device=None):
+                  device=None, fixed_basis=False):
     """
     Args:
         rgb_np: (H, W, 3) uint8 numpy array -- the only thing that starts on CPU;
                 everything else is pushed onto `device` immediately.
         device: torch.device, or None to auto-pick GPU > MPS > CPU via device_utils.get_device()
+        fixed_basis: the 'DCT baseline' ablation -- when True, `gbticl_model`
+                is ignored entirely and every block uses the SAME fixed 2D
+                DCT-II basis (graph_utils.dct_basis_and_eigvals) instead of a
+                predicted, content-adaptive one. No graph, no per-block
+                eigendecomposition -- computed once, outside the loop.
     """
     device = device or get_device()
 
     gbticl_model = (gbticl_model or UniformGBTICL()).to(device)
     coeff_model = (coeff_model or LaplaceCoeffModel()).to(device)
+    if fixed_basis:
+        dct_eigvals, dct_U = dct_basis_and_eigvals(block_size, device=device)
 
     H, W, _ = rgb_np.shape
     assert H % block_size == 0 and W % block_size == 0, \
@@ -71,10 +78,13 @@ def encode_image(rgb_np, block_size=8, quant_step=8.0,
 
     for i in range(n_bh):
         for j in range(n_bw):
-            top, left, valid_top, valid_left = get_context(canvas, i, j, block_size)
-            weights = gbticl_model.predict_edge_weights(top, left, valid_top, valid_left, block_size)
-            L = build_laplacian(weights, block_size, device=device)
-            eigvals, U = eigendecompose(L)  # torch.linalg.eigh -- GPU-accelerated when device='cuda'
+            if fixed_basis:
+                eigvals, U = dct_eigvals, dct_U
+            else:
+                top, left, valid_top, valid_left = get_context(canvas, i, j, block_size)
+                weights = gbticl_model.predict_edge_weights(top, left, valid_top, valid_left, block_size)
+                L = build_laplacian(weights, block_size, device=device)
+                eigvals, U = eigendecompose(L)  # torch.linalg.eigh -- GPU-accelerated when device='cuda'
 
             block = get_block(rgb, i, j, block_size)
             coeffs = forward_gft(block, U)
@@ -110,7 +120,8 @@ def encode_image(rgb_np, block_size=8, quant_step=8.0,
 
     payload = encoder.finish()
     meta = dict(H=H, W=W, block_size=block_size, quant_step=quant_step,
-                symbol_range=symbol_range, n_symbols_coded=n_symbols, device=str(device))
+                symbol_range=symbol_range, n_symbols_coded=n_symbols, device=str(device),
+                fixed_basis=fixed_basis)
     return payload, meta
 
 
@@ -123,17 +134,23 @@ def decode_image(payload, meta, gbticl_model=None, coeff_model=None, device=None
     block_size = meta["block_size"]
     quant_step = meta["quant_step"]
     symbol_range = meta["symbol_range"]
+    fixed_basis = meta.get("fixed_basis", False)
     n_bh, n_bw = H // block_size, W // block_size
+    if fixed_basis:
+        dct_eigvals, dct_U = dct_basis_and_eigvals(block_size, device=device)
 
     canvas = torch.zeros((H, W, 3), dtype=torch.uint8, device=device)
     decoder = RangeDecoder(payload)
 
     for i in range(n_bh):
         for j in range(n_bw):
-            top, left, valid_top, valid_left = get_context(canvas, i, j, block_size)
-            weights = gbticl_model.predict_edge_weights(top, left, valid_top, valid_left, block_size)
-            L = build_laplacian(weights, block_size, device=device)
-            eigvals, U = eigendecompose(L)
+            if fixed_basis:
+                eigvals, U = dct_eigvals, dct_U
+            else:
+                top, left, valid_top, valid_left = get_context(canvas, i, j, block_size)
+                weights = gbticl_model.predict_edge_weights(top, left, valid_top, valid_left, block_size)
+                L = build_laplacian(weights, block_size, device=device)
+                eigvals, U = eigendecompose(L)
 
             q = torch.zeros((block_size * block_size, 3), dtype=torch.int64, device=device)
             history = {0: [], 1: [], 2: []}
@@ -195,12 +212,12 @@ def _supports_temporal_coeffs(coeff_model):
 
 def encode_video(frames_np, block_size=8, quant_step=8.0,
                   gbticl_model=None, coeff_model=None, symbol_range=(-2200, 2200),
-                  device=None):
+                  device=None, fixed_basis=False):
     """
     Args:
         frames_np: (T, H, W, 3) uint8 array, or a list/sequence of (H, W, 3)
                    uint8 arrays, all the same shape.
-        (all other args: same as encode_image)
+        (all other args, including fixed_basis: same as encode_image)
 
     Returns:
         payloads: list of T bytes objects, one per frame
@@ -211,8 +228,10 @@ def encode_video(frames_np, block_size=8, quant_step=8.0,
     device = device or get_device()
     gbticl_model = (gbticl_model or UniformGBTICL()).to(device)
     coeff_model = (coeff_model or LaplaceCoeffModel()).to(device)
-    use_support = _supports_context_set(gbticl_model)
+    use_support = _supports_context_set(gbticl_model) and not fixed_basis
     use_temporal_coeffs = _supports_temporal_coeffs(coeff_model)
+    if fixed_basis:
+        dct_eigvals, dct_U = dct_basis_and_eigvals(block_size, device=device)
 
     payloads, metas = [], []
     prev_canvas = None
@@ -233,18 +252,21 @@ def encode_video(frames_np, block_size=8, quant_step=8.0,
 
         for i in range(n_bh):
             for j in range(n_bw):
-                top, left, valid_top, valid_left = get_context(canvas, i, j, block_size)
-
-                if use_support:
-                    support = get_support_set(canvas, prev_canvas, i, j, block_size)
-                    weights = gbticl_model.predict_edge_weights(
-                        top, left, valid_top, valid_left, block_size, support=support
-                    )
+                if fixed_basis:
+                    eigvals, U = dct_eigvals, dct_U
                 else:
-                    weights = gbticl_model.predict_edge_weights(top, left, valid_top, valid_left, block_size)
+                    top, left, valid_top, valid_left = get_context(canvas, i, j, block_size)
 
-                L = build_laplacian(weights, block_size, device=device)
-                eigvals, U = eigendecompose(L)
+                    if use_support:
+                        support = get_support_set(canvas, prev_canvas, i, j, block_size)
+                        weights = gbticl_model.predict_edge_weights(
+                            top, left, valid_top, valid_left, block_size, support=support
+                        )
+                    else:
+                        weights = gbticl_model.predict_edge_weights(top, left, valid_top, valid_left, block_size)
+
+                    L = build_laplacian(weights, block_size, device=device)
+                    eigvals, U = eigendecompose(L)
 
                 block = get_block(rgb, i, j, block_size)
                 coeffs = forward_gft(block, U)
@@ -280,7 +302,8 @@ def encode_video(frames_np, block_size=8, quant_step=8.0,
 
         payload = encoder.finish()
         meta = dict(H=H, W=W, block_size=block_size, quant_step=quant_step,
-                    symbol_range=symbol_range, n_symbols_coded=n_symbols, device=str(device))
+                    symbol_range=symbol_range, n_symbols_coded=n_symbols, device=str(device),
+                    fixed_basis=fixed_basis)
         payloads.append(payload)
         metas.append(meta)
 
@@ -303,7 +326,6 @@ def decode_video(payloads, metas, gbticl_model=None, coeff_model=None, device=No
     device = device or get_device()
     gbticl_model = (gbticl_model or UniformGBTICL()).to(device)
     coeff_model = (coeff_model or LaplaceCoeffModel()).to(device)
-    use_support = _supports_context_set(gbticl_model)
     use_temporal_coeffs = _supports_temporal_coeffs(coeff_model)
 
     recon_frames = []
@@ -315,8 +337,12 @@ def decode_video(payloads, metas, gbticl_model=None, coeff_model=None, device=No
         block_size = meta["block_size"]
         quant_step = meta["quant_step"]
         symbol_range = meta["symbol_range"]
+        fixed_basis = meta.get("fixed_basis", False)
+        use_support = _supports_context_set(gbticl_model) and not fixed_basis
         n_bh, n_bw = H // block_size, W // block_size
         n = block_size * block_size
+        if fixed_basis:
+            dct_eigvals, dct_U = dct_basis_and_eigvals(block_size, device=device)
 
         canvas = torch.zeros((H, W, 3), dtype=torch.uint8, device=device)
         decoder = RangeDecoder(payload)
@@ -324,18 +350,21 @@ def decode_video(payloads, metas, gbticl_model=None, coeff_model=None, device=No
 
         for i in range(n_bh):
             for j in range(n_bw):
-                top, left, valid_top, valid_left = get_context(canvas, i, j, block_size)
-
-                if use_support:
-                    support = get_support_set(canvas, prev_canvas, i, j, block_size)
-                    weights = gbticl_model.predict_edge_weights(
-                        top, left, valid_top, valid_left, block_size, support=support
-                    )
+                if fixed_basis:
+                    eigvals, U = dct_eigvals, dct_U
                 else:
-                    weights = gbticl_model.predict_edge_weights(top, left, valid_top, valid_left, block_size)
+                    top, left, valid_top, valid_left = get_context(canvas, i, j, block_size)
 
-                L = build_laplacian(weights, block_size, device=device)
-                eigvals, U = eigendecompose(L)
+                    if use_support:
+                        support = get_support_set(canvas, prev_canvas, i, j, block_size)
+                        weights = gbticl_model.predict_edge_weights(
+                            top, left, valid_top, valid_left, block_size, support=support
+                        )
+                    else:
+                        weights = gbticl_model.predict_edge_weights(top, left, valid_top, valid_left, block_size)
+
+                    L = build_laplacian(weights, block_size, device=device)
+                    eigvals, U = eigendecompose(L)
 
                 temporal_values = None
                 if use_temporal_coeffs and prev_q is not None:
