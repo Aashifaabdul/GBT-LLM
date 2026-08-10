@@ -33,6 +33,8 @@ performance note in coeff_model.py for how to make that GPU batching real
 once GBTICLPredictor/CoeffPredictor are trained models instead of placeholders.
 """
 
+import time
+
 import torch
 
 from .graph_model import UniformGBTICL, GBTICLMetaLearner
@@ -212,11 +214,17 @@ def _supports_temporal_coeffs(coeff_model):
 
 def encode_video(frames_np, block_size=8, quant_step=8.0,
                   gbticl_model=None, coeff_model=None, symbol_range=(-2200, 2200),
-                  device=None, fixed_basis=False):
+                  device=None, fixed_basis=False, verbose=True, progress_interval_s=5.0):
     """
     Args:
         frames_np: (T, H, W, 3) uint8 array, or a list/sequence of (H, W, 3)
                    uint8 arrays, all the same shape.
+        verbose: print a one-line progress update roughly every
+                 progress_interval_s seconds while encoding. Without this,
+                 a multi-minute run prints nothing between "encoding N
+                 frames..." and the final timing line, which is
+                 indistinguishable from a hang -- confirmed confusing in
+                 practice, this exists specifically to fix that.
         (all other args, including fixed_basis: same as encode_image)
 
     Returns:
@@ -237,13 +245,19 @@ def encode_video(frames_np, block_size=8, quant_step=8.0,
     prev_canvas = None
     prev_q = None  # (n_bh, n_bw, n, 3) int64, this frame's decoded coefficients, becomes next frame's temporal signal
 
-    for frame_np in frames_np:
+    n_frames_total = len(frames_np)
+    blocks_done_total = 0
+    run_start = time.time()
+    last_print = run_start
+
+    for frame_idx, frame_np in enumerate(frames_np):
         H, W, _ = frame_np.shape
         assert H % block_size == 0 and W % block_size == 0, \
             "frame dimensions must be multiples of block_size for this prototype"
 
         rgb = torch.as_tensor(frame_np, device=device)
         n_bh, n_bw = H // block_size, W // block_size
+        n_blocks_frame = n_bh * n_bw
         canvas = torch.zeros((H, W, 3), dtype=torch.uint8, device=device)
         encoder = RangeEncoder()
         n_symbols = 0
@@ -252,6 +266,17 @@ def encode_video(frames_np, block_size=8, quant_step=8.0,
 
         for i in range(n_bh):
             for j in range(n_bw):
+                if verbose:
+                    now = time.time()
+                    if now - last_print >= progress_interval_s:
+                        block_idx_frame = i * n_bw + j
+                        elapsed = now - run_start
+                        blocks_seen = blocks_done_total + block_idx_frame
+                        rate = blocks_seen / elapsed if elapsed > 0 else 0.0
+                        print(f"  [encode] frame {frame_idx + 1}/{n_frames_total}, "
+                              f"block {block_idx_frame}/{n_blocks_frame} "
+                              f"({rate:.2f} blocks/s, {elapsed:.0f}s elapsed)")
+                        last_print = now
                 if fixed_basis:
                     eigvals, U = dct_eigvals, dct_U
                 else:
@@ -307,18 +332,24 @@ def encode_video(frames_np, block_size=8, quant_step=8.0,
         payloads.append(payload)
         metas.append(meta)
 
+        blocks_done_total += n_blocks_frame
         prev_canvas = canvas.clone()
         prev_q = this_q
 
     return payloads, metas
 
 
-def decode_video(payloads, metas, gbticl_model=None, coeff_model=None, device=None):
+def decode_video(payloads, metas, gbticl_model=None, coeff_model=None, device=None,
+                  verbose=True, progress_interval_s=5.0):
     """Mirrors encode_video exactly, reading from each frame's bitstream
     instead of already knowing the coefficients, but computing
     GBT-ICL/eigendecomposition/support-set identically from the same
     canvas-derived (spatial) and prev_canvas-derived (temporal) context --
     no graph, probability model, or support-set label is ever transmitted.
+
+    verbose: same periodic progress print as encode_video -- decode is
+        usually the slower half (no KV-cache for some coefficient models,
+        one symbol at a time), so this matters at least as much here.
 
     Returns:
         list of T (H, W, 3) uint8 numpy arrays, one reconstructed frame each
@@ -332,7 +363,12 @@ def decode_video(payloads, metas, gbticl_model=None, coeff_model=None, device=No
     prev_canvas = None
     prev_q = None
 
-    for payload, meta in zip(payloads, metas):
+    n_frames_total = len(payloads)
+    blocks_done_total = 0
+    run_start = time.time()
+    last_print = run_start
+
+    for frame_idx, (payload, meta) in enumerate(zip(payloads, metas)):
         H, W = meta["H"], meta["W"]
         block_size = meta["block_size"]
         quant_step = meta["quant_step"]
@@ -340,6 +376,7 @@ def decode_video(payloads, metas, gbticl_model=None, coeff_model=None, device=No
         fixed_basis = meta.get("fixed_basis", False)
         use_support = _supports_context_set(gbticl_model) and not fixed_basis
         n_bh, n_bw = H // block_size, W // block_size
+        n_blocks_frame = n_bh * n_bw
         n = block_size * block_size
         if fixed_basis:
             dct_eigvals, dct_U = dct_basis_and_eigvals(block_size, device=device)
@@ -350,6 +387,17 @@ def decode_video(payloads, metas, gbticl_model=None, coeff_model=None, device=No
 
         for i in range(n_bh):
             for j in range(n_bw):
+                if verbose:
+                    now = time.time()
+                    if now - last_print >= progress_interval_s:
+                        block_idx_frame = i * n_bw + j
+                        elapsed = now - run_start
+                        blocks_seen = blocks_done_total + block_idx_frame
+                        rate = blocks_seen / elapsed if elapsed > 0 else 0.0
+                        print(f"  [decode] frame {frame_idx + 1}/{n_frames_total}, "
+                              f"block {block_idx_frame}/{n_blocks_frame} "
+                              f"({rate:.2f} blocks/s, {elapsed:.0f}s elapsed)")
+                        last_print = now
                 if fixed_basis:
                     eigvals, U = dct_eigvals, dct_U
                 else:
@@ -390,6 +438,7 @@ def decode_video(payloads, metas, gbticl_model=None, coeff_model=None, device=No
                 set_block(canvas, i, j, block_size, recon_u8)
 
         recon_frames.append(canvas.cpu().numpy())
+        blocks_done_total += n_blocks_frame
         prev_canvas = canvas.clone()
         prev_q = this_q
 
