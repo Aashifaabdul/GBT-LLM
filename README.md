@@ -8,7 +8,7 @@ Supervisor : Dr Debaleena Roy
 
 ## Architecture
 
-![GBT-LLM encoder and decoder architecture](docs/architecture.png)
+![GBT-LLM encoder and decoder architecture](results/figures/gbt_llm_architecture/gbt_llm_architecture.png)
 
 ## Folder structure
 
