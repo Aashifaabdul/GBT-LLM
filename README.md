@@ -37,17 +37,33 @@ GBT-LLM/
 │   └── deepmind/               Byte-level LLM (DeepMind) baseline    -> results/deepmind/
 ├── visualization/              Figures and charts
 ├── tests/                      Pytest suite
+├── sample_dataset/             Sample 1080p frames from UVG (Beauty, HoneyBee)
 ├── data/                       Extracted frames (not tracked)
 ├── checkpoints/                Trained models (not tracked)
 └── results/                    Outputs (not tracked)
 ```
+
+## Dataset
+
+This project evaluates image and video compression on the **Ultra Video Group (UVG)** dataset:
+
+> A. Mercat, M. Viitanen, and J. Vanne, “[UVG dataset: 50/120fps 4K sequences for video codec analysis and development,](https://dl.acm.org/doi/abs/10.1145/3339825.3394937)” in *Proc. ACM Multimedia Syst. Conf.*, Istanbul, Turkey, Jun. 2020. [[Tuni.fi](https://researchportal.tuni.fi/en/publications/uvg-dataset-50120fps-4k-sequences-for-video-codec-analysis-and-de)] [[PDF](https://researchportal.tuni.fi/files/42239069/MMSys20_UVG_Dataset_Camera_ready.pdf)]
+
+Two 1080p (1920×1080) sequences from the dataset are used throughout the dissertation:
+- **`Beauty`**: 120 fps, 8-bit YUV 4:2:0 sequence featuring close-up facial features, skin tone textures, and low-frequency dark backgrounds.
+- **`HoneyBee`**: 120 fps, 8-bit YUV 4:2:0 sequence featuring high spatial frequency detail (lavender blossoms) and fine motion (hovering bee).
+
+### Sample Dataset
+A full-resolution sample frame (1920×1080) from each sequence is provided in [`sample_dataset/`](sample_dataset/) for immediate experimentation without downloading the full multi-gigabyte raw YUV files:
+- [`sample_dataset/Beauty/frame0000.png`](sample_dataset/Beauty/frame0000.png)
+- [`sample_dataset/HoneyBee/frame0000.png`](sample_dataset/HoneyBee/frame0000.png)
 
 ## Requirements
 
 - Python 3.11
 - NVIDIA GPU with CUDA (recommended; CPU works for small crops)
 - ffmpeg on `PATH` (optional, for MP4 output)
-- Raw Beauty and HoneyBee sequences, 1920x1080, 8-bit 4:2:0 YUV
+- Raw Beauty and HoneyBee sequences, 1920x1080, 8-bit 4:2:0 YUV (or use the sample frames in `sample_dataset/`)
 
 ## Setup
 
