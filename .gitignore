@@ -38,3 +38,5 @@ results/figures/*
 !results/figures/full_image_graph_heatmap.png
 !results/figures/full_image_graph_zoom.png
 !results/figures/graph_visualization.png
+!results/figures/gbt_llm_architecture/
+!results/figures/gbt_llm_architecture/*
