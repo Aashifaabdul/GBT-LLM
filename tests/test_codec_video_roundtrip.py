@@ -1,9 +1,8 @@
-"""encode_video/decode_video: for models that don't use spatiotemporal
-support (UniformGBTICL/LaplaceCoeffModel etc.), video mode must reduce
-EXACTLY to per-frame encode_image/decode_image -- no hidden cross-frame
-coupling. For GBTICLMetaLearner + TinyTransformerCoeffModel (the models
-that DO use it), video mode must run end to end without NaN/crashes and
-must visibly activate temporal support once a previous frame exists."""
+"""codec.py: encode_video/decode_video. For models without temporal support
+(UniformGBTICL, LaplaceCoeffModel) video mode must reduce exactly to
+per-frame encode_image/decode_image. For GBTICLMetaLearner with
+TinyTransformerCoeffModel it must run end to end and use temporal support
+once a previous frame exists."""
 
 import numpy as np
 import torch
@@ -29,10 +28,8 @@ def _synthetic_frames(t=3, h=16, w=16, seed=0):
 
 
 def test_encode_video_matches_encode_image_for_non_temporal_models(device):
-    """Regression anchor: models with no spatiotemporal support/temporal
-    conditioning must produce IDENTICAL per-frame output whether run through
-    encode_video or through encode_image called independently per frame --
-    video mode must not silently couple frames together for these models."""
+    """Without temporal conditioning, per-frame payloads and reconstructions
+    from encode_video must equal those of independent encode_image calls."""
     frames = _synthetic_frames(t=2)
     gbticl_model = UniformGBTICL().to(device)
     coeff_model = LaplaceCoeffModel().to(device)
@@ -57,10 +54,8 @@ def test_encode_video_matches_encode_image_for_non_temporal_models(device):
 
 
 def test_video_roundtrip_metalearner_temporal_activates_after_frame0(device):
-    """GBTICLMetaLearner + TinyTransformerCoeffModel over a 3-frame clip:
-    must run without NaN/crash, and the temporal support slots must go from
-    entirely invalid (frame 0, no previous frame) to at least partially
-    valid (frame 1+, previous frame now reconstructed)."""
+    """GBTICLMetaLearner + TinyTransformerCoeffModel on a 3-frame clip must
+    encode and decode to finite frames of the original shape."""
     frames = _synthetic_frames(t=3)
     gbticl_model = GBTICLMetaLearner(block_size=8).to(device)
     coeff_model = TinyTransformerCoeffModel(block_size=8, symbol_range=WIDE_RANGE).to(device)
@@ -81,10 +76,9 @@ def test_video_roundtrip_metalearner_temporal_activates_after_frame0(device):
 
 
 def test_support_set_temporal_slots_invalid_at_frame0_valid_after(device):
-    """Direct check of the mechanism the above test relies on implicitly:
-    get_support_set's 4 temporal slots (last 4 of 8) are all invalid when
-    prev_canvas=None, and at least the co-located slot becomes valid once a
-    real previous frame is supplied."""
+    """The 4 temporal slots of get_support_set (last 4 of 8) are all invalid
+    when prev_canvas is None, and at least one becomes valid when a previous
+    frame is supplied."""
     canvas = torch.randint(0, 256, (16, 16, 3), dtype=torch.uint8, device=device)
     support_frame0 = get_support_set(canvas, None, 1, 1, block_size=8)
     assert not support_frame0["valid"][4:].any(), "all temporal slots must be invalid with no previous frame"

@@ -1,39 +1,38 @@
-"""Single source of truth for picking a device, used everywhere else via .to(device)."""
+"""Device selection and tolerant checkpoint loading."""
 
 import torch
 
 
-def get_device(prefer_gpu=True):
+def get_device(prefer_gpu=True, verbose=True):
+    """Return the best available device: CUDA, then Apple MPS, then CPU."""
     if prefer_gpu and torch.cuda.is_available():
-        return torch.device("cuda")
+        try:
+            _ = torch.zeros(1, device="cuda")
+            if verbose:
+                name = torch.cuda.get_device_name(0)
+                vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                print(f"[Device] Using CUDA GPU: {name} ({vram_gb:.2f} GB VRAM)")
+            torch.backends.cudnn.benchmark = True
+            return torch.device("cuda")
+        except Exception:
+            pass
     if prefer_gpu and getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
-        return torch.device("mps")  # Apple Silicon
+        if verbose:
+            print("[Device] Using Apple Silicon MPS")
+        return torch.device("mps")
+    if verbose:
+        print("[Device] WARNING: Running on CPU (no CUDA GPU detected). Model inference will be significantly slower.")
     return torch.device("cpu")
 
 
 def load_state_dict_relaxed(model, state_dict, label=""):
-    """load_state_dict(strict=False) with a clear printed summary of what
-    didn't match, instead of either a hard crash (strict=True) or silent
-    data loss (strict=False with no visibility).
+    """
+    load_state_dict(strict=False) that reports what did not match.
 
-    Why this exists: architectures in this project have grown new OPTIONAL
-    parameters over time (e.g. TinyTransformerCoeffModel/HFLoRACoeffModel's
-    temporal cross-frame conditioning, added after the original
-    checkpoints/gbticl_ckpt.pt was trained) -- new params with a documented
-    zero/near-zero-impact default when unused (temporal_values=None simply
-    never routes through them). A checkpoint saved before such a param
-    existed should still load and run correctly for everything it WAS
-    trained on; strict=True's hard failure ("Missing key(s)...") is overly
-    conservative for this case and was confirmed to break loading
-    pre-existing checkpoints (checkpoints/gbticl_ckpt.pt) with a confusing
-    error in the Gradio app and run_dataset_pipeline.py alike.
-
-    Missing keys keep their random initialization (fine for a genuinely new
-    feature the old checkpoint never used). Unexpected keys are silently
-    dropped -- would indicate the checkpoint is for a DIFFERENT model class
-    entirely, which model-type auto-detection (gbticl_model_type/
-    coeff_model_type in the checkpoint) is meant to prevent upstream; this
-    is a second line of defence, not the primary safeguard.
+    Newer model versions add optional parameters (for example the temporal
+    conditioning of the coefficient models) that older checkpoints lack. Missing
+    keys keep their initial values; unexpected keys are dropped and reported, as
+    they usually indicate a checkpoint of a different model class.
     """
     result = model.load_state_dict(state_dict, strict=False)
     if result.missing_keys:

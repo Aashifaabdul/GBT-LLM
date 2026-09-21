@@ -1,5 +1,5 @@
-"""context.py::get_support_set -- spatial + temporal support-set assembly
-for GBTICLMetaLearner, and graph_model.py::reference_edge_weights."""
+"""context.get_support_set (spatial and temporal support set used by
+GBTICLMetaLearner) and graph_model.reference_edge_weights."""
 
 import torch
 
@@ -23,19 +23,18 @@ def test_support_set_shape_and_dtypes(device):
 
 
 def test_support_set_top_left_corner_all_missing(device):
-    """Block (0,0) has no spatial neighbours (nothing decoded before it in
-    raster order) and, with no previous frame, no temporal neighbours
-    either -- every one of the 8 support slots must be marked invalid."""
+    """Block (0, 0) has no spatial neighbours and, without a previous frame,
+    no temporal neighbours, so all 8 support slots must be invalid."""
     canvas = torch.zeros((32, 32, 3), dtype=torch.uint8, device=device)
     support = get_support_set(canvas, None, 0, 0, block_size=8)
     assert not support["valid"].any()
 
 
 def test_support_set_interior_block_matches_get_context(device):
-    """Spatial support slots should return exactly the same context/block
-    data as calling get_context/get_block directly at that position --
-    get_support_set must not reimplement this differently."""
-    canvas = torch.arange(32 * 32 * 3, dtype=torch.uint8, device=device).reshape(32, 32, 3) % 256
+    """Spatial slots must equal the output of get_context/get_block at the
+    corresponding neighbour position."""
+    canvas = (torch.arange(32 * 32 * 3, device=device) % 256).to(torch.uint8).reshape(32, 32, 3)
+
     support = get_support_set(canvas, None, 2, 2, block_size=8)
 
     # slot 0 = left neighbour (0,-1) -> block (2,1)
@@ -55,8 +54,8 @@ def test_support_set_temporal_disabled_without_prev_frame(device):
 
 
 def test_reference_edge_weights_uniform_block_gives_uniform_weights(device):
-    """A perfectly flat (constant-colour) block has zero pixel differences
-    everywhere -> every edge weight should be exp(0) = 1."""
+    """A constant-colour block has zero pixel differences, so every edge
+    weight is exp(0) = 1."""
     block = torch.full((8, 8, 3), 150, dtype=torch.uint8, device=device)
     weights = reference_edge_weights(block, block_size=8)
     n_edges = len(edge_list(8))
@@ -65,17 +64,16 @@ def test_reference_edge_weights_uniform_block_gives_uniform_weights(device):
 
 
 def test_reference_edge_weights_sharp_edge_gets_downweighted(device):
-    """A block with a hard vertical edge (left half dark, right half bright)
-    should down-weight the horizontal edges crossing that boundary relative
-    to edges within a flat region."""
+    """Horizontal edges crossing a hard vertical boundary must get a lower
+    weight than edges inside a flat region."""
     block = torch.zeros((8, 8, 3), dtype=torch.uint8, device=device)
     block[:, :4, :] = 10
     block[:, 4:, :] = 240
     weights = reference_edge_weights(block, block_size=8)
 
     edges = edge_list(8)
-    # find a horizontal edge crossing the boundary (col 3 -> col 4) vs one
-    # entirely within the dark region (col 0 -> col 1)
+
+    # edge crossing the boundary (col 3 -> 4) versus one inside the dark half (col 0 -> 1)
     crossing_idx = edges.index((0 * 8 + 3, 0 * 8 + 4))
     flat_idx = edges.index((0 * 8 + 0, 0 * 8 + 1))
     assert weights[crossing_idx] < weights[flat_idx]

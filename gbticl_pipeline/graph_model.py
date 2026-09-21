@@ -1,36 +1,33 @@
 """
-GBT-ICL: the in-context graph-Laplacian predictor.
+GBT-ICL: prediction of graph-Laplacian edge weights for a block.
 
-STATUS: four implementations, in increasing order of capability.
-  - UniformGBTICL / ContextGradientGBTICL: non-learned stand-ins (see their
-    own docstrings). Kept as baselines/ablations -- your results should show
-    the trained models beating both of these, not just existing.
-  - GBTICLNet: a trainable MLP over the decoded context (top row + left
-    column, both channels and a coarse gradient summary), predicting all 112
-    edge weights in one forward pass. Genuinely trained via training.py.
-    Kept as an explicit ablation baseline ("context-conditional regressor,
-    non-meta-learning") against GBTICLMetaLearner below.
-  - GBTICLMetaLearner: the primary GBT-ICL model. A genuine few-shot
-    in-context meta-learner -- see its own docstring for the full design.
+All models predict one weight per edge of the 4-connected grid graph over a
+block (112 edges for 8x8), given only causally decoded data, so encoder and
+decoder obtain the same graph without transmitting it.
 
-All four subclass nn.Module so `.to(device)` and normal optimizer/checkpoint
-machinery just work identically.
+  - UniformGBTICL: all weights 1 (this gives a fixed grid-graph transform).
+  - ContextGradientGBTICL: heuristic, down-weights border edges across
+    brightness jumps seen in the decoded context.
+  - GBTICLNet: MLP mapping the block's own context to edge weights
+    (non-meta-learning ablation baseline).
+  - GBTICLMetaLearner: the main model; attends over a support set of
+    already-decoded blocks paired with reference graphs computed from them.
+
+All models subclass nn.Module.
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 def edge_list(block_size):
-    """4-connected grid graph over a block_size x block_size block.
+    """Edges of the 4-connected grid graph over a block_size x block_size block.
 
-    Node index for pixel (r, c) is r * block_size + c.
-    Returns a list of (node_i, node_j) tuples, one per edge.
-    For block_size=8: 56 horizontal + 56 vertical = 112 edges.
-    This is static index bookkeeping, not numerical work -- deliberately kept
-    as plain Python/no tensors, it's the same on every device.
+    Node index for pixel (r, c) is r * block_size + c. Returns a list of
+    (node_i, node_j) tuples; for block_size=8 there are 56 horizontal and
+    56 vertical edges (112 in total).
     """
+
     edges = []
     for r in range(block_size):
         for c in range(block_size):
@@ -44,30 +41,20 @@ def edge_list(block_size):
 
 def reference_edge_weights(block, block_size, edge_sensitivity=0.15):
     """
-    Deterministic, closed-form 'target' graph for an ALREADY-DECODED block,
-    computed directly from its true known pixels -- the classical GBT
-    graph-construction rule (Gaussian/exponential pixel-similarity kernel
-    over the 4-connected grid: edges spanning a sharp brightness jump get
-    down-weighted, "don't smooth across an edge").
+    Closed-form reference graph for a fully known block.
 
-    This is used only to build support-set labels for GBTICLMetaLearner
-    (below): every already-decoded block's true pixels are known to BOTH
-    encoder and decoder, so this function's output is identically
-    reproducible on both sides without transmitting anything. It is
-    distinct from ContextGradientGBTICL, which only has access to a query
-    block's *border* context (the block itself isn't decoded yet) and so
-    can only estimate weights for edges touching that border -- here, the
-    whole block is known, so every one of the n_edges edges gets a real,
-    non-default estimate.
+    Each edge weight is exp(-edge_sensitivity * |gray_i - gray_j|), the usual
+    pixel-similarity rule: edges across a sharp intensity jump are weakened.
+    Used to label the support blocks of GBTICLMetaLearner; those blocks are
+    already decoded, so encoder and decoder compute identical labels.
 
     Args:
-        block: (block_size, block_size, 3) tensor (any numeric dtype), the
-               support block's true/reconstructed pixels
+        block: (block_size, block_size, 3) tensor of pixel values
         block_size: int
-        edge_sensitivity: same role/units as ContextGradientGBTICL's
+        edge_sensitivity: decay rate of the weight with intensity difference
 
     Returns:
-        weights: (n_edges,) float64 tensor, same device as `block`
+        (n_edges,) float64 tensor on the device of `block`
     """
     device = block.device
     edges = edge_list(block_size)
@@ -79,7 +66,7 @@ def reference_edge_weights(block, block_size, edge_sensitivity=0.15):
 
 
 def reference_edge_weights_batch(blocks, block_size, edge_sensitivity=0.15):
-    """Batched version of reference_edge_weights: blocks (B, bs, bs, 3) -> (B, n_edges)."""
+    """Batched reference_edge_weights: (B, bs, bs, 3) blocks -> (B, n_edges) weights."""
     device = blocks.device
     edges = edge_list(block_size)
     b = blocks.shape[0]
@@ -91,35 +78,34 @@ def reference_edge_weights_batch(blocks, block_size, edge_sensitivity=0.15):
 
 
 class GBTICLPredictor(nn.Module):
-    """Interface every GBT-ICL implementation (placeholder or trained) must satisfy."""
+    """Interface shared by all edge-weight predictors."""
 
-    def predict_edge_weights(self, top_ctx, left_ctx, valid_top, valid_left, block_size):
+    def predict_edge_weights(self, top_ctx, left_ctx, valid_top, valid_left, block_size, support=None):
         """
         Args:
-            top_ctx:  (block_size, 3) uint8 tensor, on this module's device --
-                      bottom row of the block above (or padding)
-            left_ctx: (block_size, 3) uint8 tensor, on this module's device --
-                      right column of the block to the left (or padding)
-            valid_top, valid_left: bool -- whether that context is real or padded
+            top_ctx:  (block_size, 3) uint8 bottom row of the block above (or padding)
+            left_ctx: (block_size, 3) uint8 right column of the block to the left (or padding)
+            valid_top, valid_left: whether that context is real or padding
             block_size: int
+            support: optional support set from context.get_support_set
+                (used by GBTICLMetaLearner only)
 
         Returns:
-            weights: (n_edges,) float64 tensor, on this module's device, one
-                     weight per edge from edge_list(block_size), same order.
+            (n_edges,) float64 tensor, one weight per edge of edge_list(block_size).
         """
         raise NotImplementedError
 
 
 class UniformGBTICL(GBTICLPredictor):
-    """Placeholder: equal weight everywhere (untrained baseline). See module docstring."""
+    """Weight 1 on every edge (untrained baseline)."""
 
     def __init__(self):
         super().__init__()
-        # a parameter-free module still needs something for .to(device) to act on,
-        # and it doubles as "where am I currently living" for the placeholder logic
+
+        # A parameter-free module needs a buffer so .to(device) has something to move
         self.register_buffer("_device_anchor", torch.zeros(1))
 
-    def predict_edge_weights(self, top_ctx, left_ctx, valid_top, valid_left, block_size):
+    def predict_edge_weights(self, top_ctx, left_ctx, valid_top, valid_left, block_size, support=None):
         device = self._device_anchor.device
         n_edges = len(edge_list(block_size))
         return torch.ones(n_edges, dtype=torch.float64, device=device)
@@ -127,13 +113,11 @@ class UniformGBTICL(GBTICLPredictor):
 
 class ContextGradientGBTICL(GBTICLPredictor):
     """
-    A second, still-non-learned placeholder that is at least context-sensitive,
-    for sanity-checking the pipeline responds to context before a real model exists.
+    Non-learned, context-sensitive baseline.
 
-    Heuristic only (not the research contribution): edges near a border with a
-    sharp brightness jump in the available context get down-weighted (mimicking
-    "don't smooth across an edge"); everywhere else defaults to uniform weight.
-    This is deliberately simple and is expected to be replaced.
+    Edges along the first row/column of the block are down-weighted by
+    exp(-edge_sensitivity * jump), where jump is the brightness step between the
+    same two pixels in the decoded context; all other edges keep weight 1.
     """
 
     def __init__(self, edge_sensitivity=0.15):
@@ -141,7 +125,7 @@ class ContextGradientGBTICL(GBTICLPredictor):
         self.edge_sensitivity = edge_sensitivity
         self.register_buffer("_device_anchor", torch.zeros(1))
 
-    def predict_edge_weights(self, top_ctx, left_ctx, valid_top, valid_left, block_size):
+    def predict_edge_weights(self, top_ctx, left_ctx, valid_top, valid_left, block_size, support=None):
         device = self._device_anchor.device
         edges = edge_list(block_size)
         weights = torch.ones(len(edges), dtype=torch.float64, device=device)
@@ -152,8 +136,8 @@ class ContextGradientGBTICL(GBTICLPredictor):
         for idx, (i, j) in enumerate(edges):
             ri, ci = divmod(i, block_size)
             rj, cj = divmod(j, block_size)
-            # only down-weight edges that touch the first row/col, where we have
-            # a real signal about a boundary discontinuity from context
+
+            # only the first row/column has context to compare against
             if ri == 0 and rj == 0 and top_gray is not None and abs(ci - cj) == 1:
                 jump = torch.abs(top_gray[ci] - top_gray[cj])
                 weights[idx] = torch.exp(-self.edge_sensitivity * jump)
@@ -164,27 +148,25 @@ class ContextGradientGBTICL(GBTICLPredictor):
 
 
 def context_features(top_ctx, left_ctx, valid_top, valid_left, block_size, device, dtype=torch.float32):
-    """The single context-feature-extraction implementation shared by
-    GBTICLNet and GBTICLMetaLearner (both a query block's own context and,
-    for the meta-learner, every support-set item's context go through this
-    same function) -- so the two models can never architecturally drift
-    apart on what "context" means. See GBTICLNet's docstring for the
-    feature layout. Batched: (B, block_size, 3) -> (B, in_dim).
+    """
+    Context feature vector shared by GBTICLNet and GBTICLMetaLearner.
+
+    Layout: top and left context values scaled to [0, 1] (2 * bs * 3), their
+    finite-difference gradients along the grey-level profile (2 * (bs - 1)) and
+    the two validity flags (2).
 
     Args:
         top_ctx, left_ctx: (B, block_size, 3) tensors (any numeric dtype)
-        valid_top, valid_left: (B,) bool tensors (or plain Python bools,
-            broadcast to a batch of 1)
+        valid_top, valid_left: (B,) bool tensors, or plain bools (batch of 1)
     Returns:
         (B, in_dim) float tensor, in_dim = 2*block_size*3 + 2*(block_size-1) + 2
     """
-    bs = block_size
-    top = top_ctx.to(device=device, dtype=dtype) / 255.0    # (B, bs, 3)
+    top = top_ctx.to(device=device, dtype=dtype) / 255.0  # (B, bs, 3)
     left = left_ctx.to(device=device, dtype=dtype) / 255.0  # (B, bs, 3)
     b = top.shape[0]
-    top_gray = top.mean(dim=-1)    # (B, bs)
+    top_gray = top.mean(dim=-1)  # (B, bs)
     left_gray = left.mean(dim=-1)  # (B, bs)
-    top_grad = top_gray[:, 1:] - top_gray[:, :-1]     # (B, bs-1)
+    top_grad = top_gray[:, 1:] - top_gray[:, :-1]  # (B, bs-1)
     left_grad = left_gray[:, 1:] - left_gray[:, :-1]  # (B, bs-1)
 
     def _flags(v):
@@ -199,29 +181,18 @@ def context_features(top_ctx, left_ctx, valid_top, valid_left, block_size, devic
 
 
 def context_feature_dim(block_size):
+    """Length of the vector returned by context_features."""
     return 2 * block_size * 3 + 2 * (block_size - 1) + 2
 
 
 class GBTICLNet(GBTICLPredictor):
     """
-    The real, trainable GBT-ICL model. Predicts all n_edges edge weights in
-    one forward pass from the decoded context, via a small MLP -- no hand
-    tuning, no formula, weights are learned end to end by training.py.
+    MLP that maps the decoded context of one block directly to its edge weights.
 
-    Input features per call, built from `top_ctx`/`left_ctx` (each
-    (block_size, 3) uint8, or the (block_size,3) zero-padding tensor used
-    for border blocks):
-      - top_ctx, left_ctx flattened and normalised to [0,1]      -> 2*block_size*3
-      - top_ctx / left_ctx local gradients (finite differences)  -> 2*(block_size-1)
-      - valid_top, valid_left flags (0/1)                        -> 2
-    For block_size=8 that's 48 + 14 + 2 = 64 input features -- small on
-    purpose, since the whole point of a fixed 4-connected topology is that
-    the prediction target (112 numbers) doesn't need a heavy model.
-
-    forward() is the batched entry point used by training.py (operates on a
-    batch of contexts at once, shape (B, feat_dim) -> (B, n_edges)).
-    predict_edge_weights() is the single-context entry point the codec loop
-    (encode_image/decode_image) actually calls, batch size 1.
+    Input is the context_features vector (64 features for 8x8 blocks); output is
+    one logit per edge, converted to a positive weight by to_weights. forward()
+    is the batched entry point used for training; predict_edge_weights() is the
+    single-block entry point used by the codec.
     """
 
     def __init__(self, block_size=8, hidden=96, n_layers=2):
@@ -241,30 +212,23 @@ class GBTICLNet(GBTICLPredictor):
         self.n_edges = n_edges
 
     def features_batch(self, top_ctx, left_ctx, valid_top, valid_left, device, dtype=torch.float32):
-        """The feature-extraction implementation used both by training (real
-        batches, from training.py's DataLoader) and by inference
-        (predict_edge_weights, batch size 1). Delegates to the module-level
-        context_features() -- the same function GBTICLMetaLearner uses for
-        every support-set item's context -- so no two models in this file
-        can architecturally drift apart on what "context" means.
-        """
+        """Feature vectors for a batch of contexts (see context_features)."""
         return context_features(top_ctx, left_ctx, valid_top, valid_left, self.block_size, device, dtype)
 
     def forward(self, features_batch):
-        """features_batch: (B, in_dim) -> raw logits (B, n_edges). Squashed to
-        (0, 1] with an exponential (never exactly 0, so the Laplacian never
-        becomes singular in a way that breaks eigendecomposition on an
-        isolated node) via `to_weights`."""
+        """(B, in_dim) features -> (B, n_edges) logits; apply to_weights for edge weights."""
         return self.net(features_batch)
 
     @staticmethod
     def to_weights(logits):
-        """Map unconstrained network output to valid, positive edge weights.
-        exp() rather than sigmoid: unbounded above (an edge can be predicted
-        *stronger* than a default 1.0, not just weakened), always > 0."""
+        """Map logits to strictly positive edge weights, exp(clamp(logits, -8, 3)).
+
+        The lower clamp keeps every weight above zero so no node becomes isolated
+        in the Laplacian; exp (rather than sigmoid) lets an edge exceed weight 1.
+        """
         return torch.exp(torch.clamp(logits, min=-8.0, max=3.0))
 
-    def predict_edge_weights(self, top_ctx, left_ctx, valid_top, valid_left, block_size):
+    def predict_edge_weights(self, top_ctx, left_ctx, valid_top, valid_left, block_size, support=None):
         assert block_size == self.block_size, (
             f"GBTICLNet was built for block_size={self.block_size}, got {block_size}"
         )
@@ -278,47 +242,21 @@ class GBTICLNet(GBTICLPredictor):
 
 class GBTICLMetaLearner(GBTICLPredictor):
     """
-    The primary GBT-ICL model: a genuine few-shot IN-CONTEXT meta-learner,
-    not a context-conditional regressor (that's what GBTICLNet above is --
-    kept as an explicit ablation baseline for exactly this comparison).
+    In-context meta-learner for edge weights (the main GBT-ICL model).
 
-    THE KEY DIFFERENCE FROM GBTICLNet: GBTICLNet maps one block's own
-    context straight to edge weights -- at inference it never looks at any
-    other block, so there is no actual "learning from examples in context,"
-    just a fixed function of local pixels. This model instead predicts the
-    query block's edge weights by attending over a SUPPORT SET of other
-    already-decoded blocks (context.py's get_support_set: up to 4 spatial
-    neighbours in the current frame + up to 4 temporal neighbours in the
-    previous frame), each paired with a REFERENCE edge-weight graph computed
-    in closed form directly from that support block's own true pixels
-    (reference_edge_weights(), above) -- exactly analogous to a few-shot
-    prompt: "here are K examples of (local context -> good graph) pairs
-    from content you've already seen; predict the graph for this new query
-    context." No gradient updates happen at inference -- the support set
-    itself IS the in-context conditioning, the same way an LLM conditions
-    on a prompt without any weight update. The model is meta-trained (see
-    training.py's episodic sampling) across many (query, support-set) pairs
-    so it generalises to new image/video content purely through this
-    in-context conditioning at test time, never fine-tuned per test
-    sequence.
+    The edge weights of the query block are predicted by cross-attention over a
+    support set of already-decoded blocks (context.get_support_set: up to 4
+    spatial neighbours in the current frame and 4 temporal neighbours in the
+    previous frame). Each support item is a (context features, reference graph)
+    pair, where the reference graph is computed by reference_edge_weights from
+    the support block's own decoded pixels. No weights are updated at inference;
+    the support set is the only conditioning, and the model is meta-trained on
+    many (query, support) episodes (see training.py).
 
-    Architecture: cross-attention (nn.MultiheadAttention, 1 layer) with the
-    query block's own context as the attention query, and the support set's
-    (context embedding + reference-weight embedding) as keys/values.
-    Missing support slots (context.py marks these with valid=False -- e.g.
-    the very first block of the very first frame, which has neither spatial
-    nor temporal neighbours) are replaced with a learned "missing support"
-    embedding, so the model degrades gracefully rather than needing special-
-    cased code paths for partial support sets.
-
-    BACKWARD COMPATIBLE call signature: predict_edge_weights() accepts an
-    optional `support` argument (context.py's get_support_set() output). If
-    omitted (support=None), an all-missing support set is synthesised
-    internally, so this class is also a drop-in for the plain
-    encode_image/decode_image path (codec.py) with graceful degradation to
-    "no in-context evidence, use the learned fallback" -- exactly the
-    intra-frame, first-block-of-a-sequence case anyway. encode_video/
-    decode_video (below) are what actually supply a real support set.
+    Missing support slots (for example the first block of a frame) are replaced
+    by a learned "missing support" embedding. predict_edge_weights(support=None)
+    uses an all-missing support set, so the model also works in the single-image
+    path.
     """
 
     def __init__(self, block_size=8, d_model=64, n_heads=4, hidden=96):
@@ -338,54 +276,50 @@ class GBTICLMetaLearner(GBTICLPredictor):
         self.support_weight_proj = nn.Sequential(
             nn.Linear(self.n_edges, d_model), nn.GELU(), nn.Linear(d_model, d_model)
         )
-        # learned "no support item here" fallback embedding (same trick as
-        # TinyTransformerCoeffModel's `bos` and HFLoRACoeffModel's `bos`)
+
+        # Learned embedding that stands in for an unavailable support item
         self.missing_support = nn.Parameter(torch.zeros(d_model))
 
         self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
         self.out_head = nn.Sequential(nn.Linear(d_model, hidden), nn.GELU(), nn.Linear(hidden, self.n_edges))
 
     def forward(self, query_feats, support_ctx_feats, support_weights, support_valid):
-        """Batched entry point used by training.py's episodic meta-training.
+        """Batched forward pass used for meta-training.
 
         Args:
-            query_feats:        (B, ctx_dim) float
-            support_ctx_feats:  (B, K, ctx_dim) float
-            support_weights:    (B, K, n_edges) float -- reference weights
-                                 from reference_edge_weights_batch(), or any
-                                 placeholder value for invalid slots (masked
-                                 out below regardless of its actual content)
-            support_valid:      (B, K) bool
+            query_feats:       (B, ctx_dim)
+            support_ctx_feats: (B, K, ctx_dim)
+            support_weights:   (B, K, n_edges) reference graphs of the support blocks
+            support_valid:     (B, K) bool, False for missing support slots
 
         Returns:
-            logits: (B, n_edges) -- pass through to_weights() for valid
-                    positive edge weights, same convention as GBTICLNet
+            (B, n_edges) logits; apply to_weights for edge weights.
         """
-        q = self.query_proj(query_feats).unsqueeze(1)         # (B, 1, d)
-        s_ctx = self.support_ctx_proj(support_ctx_feats)      # (B, K, d)
+        # Embed the query context and support examples
+        q = self.query_proj(query_feats).unsqueeze(1)  # (B, 1, d)
+        s_ctx = self.support_ctx_proj(support_ctx_feats)  # (B, K, d)
         s_w = self.support_weight_proj(support_weights.to(s_ctx.dtype))  # (B, K, d)
-        kv = s_ctx + s_w                                       # (B, K, d)
+        kv = s_ctx + s_w  # (B, K, d)
 
+        # Replace unavailable support items with a learned embedding
         missing = self.missing_support.to(kv.dtype)
-        valid_mask = support_valid.unsqueeze(-1)                # (B, K, 1)
-        # soft substitution (not a hard attention mask): missing slots carry
-        # the learned fallback embedding instead of being excluded outright,
-        # so the model can itself learn what "no support was available"
-        # means as a signal, and every query keeps a fixed-shape (B, K, d)
-        # key/value tensor regardless of how many slots are actually valid
+        valid_mask = support_valid.unsqueeze(-1)  # (B, K, 1)
+
+        # Missing slots get the learned embedding instead of being masked out,
+        # so the model can use "no support here" as a signal
         kv = torch.where(valid_mask, kv, missing.expand_as(kv))
 
-        attn_out, _ = self.attn(q, kv, kv)   # (B, 1, d)
+        # Attend to support examples and predict graph-edge weights
+        attn_out, _ = self.attn(q, kv, kv)  # (B, 1, d)
         return self.out_head(attn_out.squeeze(1))  # (B, n_edges)
 
     @staticmethod
     def to_weights(logits):
+        """Same mapping as GBTICLNet.to_weights."""
         return torch.exp(torch.clamp(logits, min=-8.0, max=3.0))
 
     def _empty_support(self, device):
-        k = 8  # matches context.N_SUPPORT; duplicated as a literal to avoid
-               # a context.py -> graph_model.py import (context.py already
-               # imports nothing from here, keep it that way)
+        k = 8  # equals context.N_SUPPORT (literal to avoid importing context here)
         return dict(
             top=torch.full((k, self.block_size, 3), 128, dtype=torch.uint8, device=device),
             left=torch.full((k, self.block_size, 3), 128, dtype=torch.uint8, device=device),
@@ -403,21 +337,23 @@ class GBTICLMetaLearner(GBTICLPredictor):
         if support is None:
             support = self._empty_support(device)
 
+        # Convert query context into model features
         query_feats = context_features(
             top_ctx.unsqueeze(0), left_ctx.unsqueeze(0), valid_top, valid_left, block_size, device
         )  # (1, ctx_dim)
 
-        k = support["top"].shape[0]
         support_ctx_feats = context_features(
             support["top"], support["left"], support["valid_top"], support["valid_left"],
             block_size, device,
         ).unsqueeze(0)  # (1, K, ctx_dim)
 
+        # Derive reference graphs from decoded support blocks
         support_weights = reference_edge_weights_batch(
             support["block"].to(device), block_size
         ).unsqueeze(0)  # (1, K, n_edges)
 
         support_valid = support["valid"].to(device).unsqueeze(0)  # (1, K)
 
+        # Predict positive weights for all graph edges
         logits = self.forward(query_feats, support_ctx_feats, support_weights, support_valid).squeeze(0)
         return self.to_weights(logits).to(torch.float64)

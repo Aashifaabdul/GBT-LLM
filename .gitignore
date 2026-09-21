@@ -1,4 +1,5 @@
-# Raw/large regenerable data
+# Raw and regenerable data
+data/
 *.yuv
 *.7z
 **/frames/*.png
@@ -10,13 +11,11 @@
 **/reconstructed_video.mp4
 **/original_video.mp4
 
-# Checkpoints and results (regenerable via training.py / run_dataset_pipeline.py)
+# Checkpoints and results
 checkpoints/*.pt
-results/
+submission_results/
 
-# Stray interrupted-write temp files (observed pattern from prior sandbox runs,
-# e.g. ".frame0495_blocks_8x8.npy.FiW3i9", ".frame0537.png.lKmA3l") -- always
-# dotfiles, never something we want tracked
+# Interrupted-write temporary files
 .frame*
 
 # Python
@@ -24,11 +23,18 @@ __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
+.ruff_cache/
 *.egg-info/
 
-# Editors/OS
+# Editors and OS
 .DS_Store
 Thumbs.db
 
-# Keep small tracked artifacts explicitly (negation patterns, evaluated last)
-!figures/.gitkeep
+# Results are not tracked, except the graph figures
+!results/
+results/*
+!results/figures/
+results/figures/*
+!results/figures/full_image_graph_heatmap.png
+!results/figures/full_image_graph_zoom.png
+!results/figures/graph_visualization.png

@@ -1,9 +1,18 @@
+"""Draw the predicted graph (nodes and weighted edges) of one real 8x8 block.
+
+Panels: the block with its top/left context strips, the uniform graph (every weight 1) and the
+ContextGradientGBTICL graph (green = strong, red = weak). The edge rule is a NumPy copy of
+gbticl_pipeline.graph_model.ContextGradientGBTICL (weight exp(-0.15 * |grey jump|) on the 14
+block-border edges, 1 elsewhere), so PyTorch is not needed here.
+Reads data/Beauty/frames/frame0000.png and writes results/figures/graph_visualization.png.
+
+Usage: python visualization/visualize_graph.py
 """
-Visualize the actual predicted graph (nodes + weighted edges) for one real
-block from the dataset, overlaid on the block's pixels, next to the context
-it was derived from. Pure numpy re-implementation of ContextGradientGBTICL's
-logic (torch isn't installable in this sandbox) -- identical math.
-"""
+import sys
+from pathlib import Path
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -15,6 +24,7 @@ EDGE_SENSITIVITY = 0.15
 
 
 def edge_list(block_size):
+    """4-neighbour grid edges (right and down) of a block_size x block_size block as node-index pairs (row-major)."""
     edges = []
     for r in range(block_size):
         for c in range(block_size):
@@ -27,6 +37,7 @@ def edge_list(block_size):
 
 
 def context_gradient_weights(top_ctx, left_ctx, block_size, sensitivity=EDGE_SENSITIVITY):
+    """Edge weights exp(-sensitivity * jump) for the first row/column of the block, 1 elsewhere; returns (weights, edges)."""
     edges = edge_list(block_size)
     weights = np.ones(len(edges), dtype=np.float64)
     top_gray = top_ctx.astype(np.float64).mean(axis=-1)
@@ -44,17 +55,16 @@ def context_gradient_weights(top_ctx, left_ctx, block_size, sensitivity=EDGE_SEN
     return weights, edges
 
 
-# ---- load the real frame and grab the high-variance block we found ----
 img = np.array(Image.open(
-    "/sessions/great-upbeat-mccarthy/mnt/Dataset/gbticl_dataset/Beauty/frames/frame0000.png"
+    ROOT_DIR / "data/Beauty/frames/frame0000.png"
 ).convert("RGB"))
 
-bi, bj = 124, 233  # block indices found earlier
+bi, bj = 124, 233  # (block row, block column) of a high-variance block
 r0, c0 = bi * BLOCK_SIZE, bj * BLOCK_SIZE
 
 block = img[r0:r0 + BLOCK_SIZE, c0:c0 + BLOCK_SIZE, :]
-top_ctx = img[r0 - 1, c0:c0 + BLOCK_SIZE, :]           # bottom row of block above
-left_ctx = img[r0:r0 + BLOCK_SIZE, c0 - 1, :]          # right col of block to the left
+top_ctx = img[r0 - 1, c0:c0 + BLOCK_SIZE, :]  # bottom row of block above
+left_ctx = img[r0:r0 + BLOCK_SIZE, c0 - 1, :]  # right col of block to the left
 
 weights, edges = context_gradient_weights(top_ctx, left_ctx, BLOCK_SIZE)
 uniform_weights = np.ones(len(edges))
@@ -64,10 +74,11 @@ print(f"weights: min={weights.min():.3f}, max={weights.max():.3f}, "
       f"n_below_0.5={np.sum(weights < 0.5)} of {len(weights)} edges "
       f"(only the 14 border-touching edges can ever move)")
 
-# ---- figure ----
+
 fig, axes = plt.subplots(1, 3, figsize=(16, 5.5))
 
-# panel 1: the block itself, with context strips shown attached
+
+# panel 1: the block with its context strips attached (white corner is unused)
 canvas = np.full((BLOCK_SIZE + 1, BLOCK_SIZE + 1, 3), 255, dtype=np.uint8)
 canvas[1:, 1:] = block
 canvas[0, 1:] = top_ctx
@@ -79,6 +90,7 @@ axes[0].set_title("Block (bottom-right 8x8)\n+ context strips (red line = bounda
 axes[0].set_xticks([]); axes[0].set_yticks([])
 
 def draw_graph(ax, block_img, edges, weights, title):
+    """Overlay the graph on the block; edge colour and width encode the weight."""
     ax.imshow(block_img, interpolation="nearest", extent=(-0.5, BLOCK_SIZE - 0.5, BLOCK_SIZE - 0.5, -0.5))
     node_xy = np.array([[c, r] for r in range(BLOCK_SIZE) for c in range(BLOCK_SIZE)])
 
@@ -86,7 +98,7 @@ def draw_graph(ax, block_img, edges, weights, title):
     for (i, j), w in zip(edges, weights):
         p1, p2 = node_xy[i], node_xy[j]
         segs.append([p1, p2])
-        colors.append(plt.cm.RdYlGn(w))   # red = weak/near-0, green = strong/near-1
+        colors.append(plt.cm.RdYlGn(w))  # red = weak/near-0, green = strong/near-1
         lws.append(0.5 + 3.5 * w)
 
     lc = LineCollection(segs, colors=colors, linewidths=lws)
@@ -102,5 +114,6 @@ draw_graph(axes[2], block, edges, weights, "ContextGradientGBTICL\ngreen=strong 
 
 fig.suptitle(f"Predicted graph on a real block -- Beauty frame0000, block ({bi},{bj})", fontsize=12)
 fig.tight_layout()
-fig.savefig("/sessions/great-upbeat-mccarthy/mnt/outputs/graph_visualization.png", dpi=140, bbox_inches="tight")
+(ROOT_DIR / "results/figures").mkdir(parents=True, exist_ok=True)
+fig.savefig(ROOT_DIR / "results/figures/graph_visualization.png", dpi=140, bbox_inches="tight")
 print("saved graph_visualization.png")

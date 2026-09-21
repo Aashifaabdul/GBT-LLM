@@ -1,5 +1,5 @@
-"""graph_utils.dct_basis_and_eigvals + codec.py's fixed_basis=True path --
-the 'DCT baseline' ablation."""
+"""DCT baseline: graph_utils.dct_basis_and_eigvals and the fixed_basis=True
+path of codec.encode_image/decode_image."""
 
 import torch
 
@@ -43,8 +43,8 @@ def test_codec_fixed_basis_roundtrip(device):
 
 
 def test_codec_fixed_basis_ignores_gbticl_model():
-    """fixed_basis=True must bypass gbticl_model entirely -- passing an
-    untrained/garbage model should give IDENTICAL output to passing none."""
+    """With fixed_basis=True the graph model is unused: passing an untrained
+    model must give the same payload as passing none."""
     import numpy as np
     from gbticl_pipeline.graph_model import GBTICLNet
     device = torch.device("cpu")

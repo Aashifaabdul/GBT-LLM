@@ -1,14 +1,9 @@
 """
-Context extraction for the encode/decode loop.
+Causal context and support-set extraction for the encode/decode loop.
 
-Unlike gbticl_context_extraction.py (which precomputes context for every
-block of an already-fully-decoded frame, for dataset-prep / inspection),
-this version reads context from a `canvas` tensor that is being filled in
-block by block as the raster-order loop runs -- i.e. it only ever sees the
-same "already decoded" pixels a real decoder would have at that point. This
-is the version the actual codec loop uses. `canvas` lives on whatever device
-codec.py put it on (CPU or GPU); every tensor returned here stays on that
-same device, no implicit transfers.
+All functions read from a `canvas` tensor that is filled in block by block in
+raster order, so they only ever see pixels that the decoder also has at that
+point. Returned tensors stay on the device of the canvas.
 """
 
 import torch
@@ -18,15 +13,17 @@ PAD_VALUE = 128
 
 def get_context(canvas, i, j, block_size):
     """
+    Causal context of block (i, j): the last row of the block above and the last
+    column of the block to its left. Missing context (image border) is padded
+    with PAD_VALUE and flagged invalid.
+
     Args:
-        canvas: (H, W, 3) uint8 tensor, on some device. Blocks already written
-                are real pixels; blocks not yet processed are never read by a
-                correct caller (raster order guarantees this).
-        i, j: block row/col index
+        canvas: (H, W, 3) uint8 tensor holding the blocks decoded so far
+        i, j: block row/column index
         block_size: int
 
     Returns:
-        top, left: (block_size, 3) uint8 tensors, same device as canvas
+        top, left: (block_size, 3) uint8 tensors on the canvas device
         valid_top, valid_left: bool
     """
     device = canvas.device
@@ -53,62 +50,43 @@ def get_context(canvas, i, j, block_size):
 
 
 def get_block(image, i, j, block_size):
+    """View of block (i, j) of `image`."""
     r0, c0 = i * block_size, j * block_size
     return image[r0:r0 + block_size, c0:c0 + block_size, :]
 
 
 def set_block(canvas, i, j, block_size, block):
+    """Write `block` into position (i, j) of `canvas`."""
     r0, c0 = i * block_size, j * block_size
     canvas[r0:r0 + block_size, c0:c0 + block_size, :] = block
 
 
-# ---------------------------------------------------------------------------
-# Support-set assembly for GBTICLMetaLearner (graph_model.py) -- the few-shot
-# in-context conditioning set for a query block, built from OTHER already-
-# decoded blocks (never the query block itself, which isn't decoded yet).
-# ---------------------------------------------------------------------------
+# Support set for GBTICLMetaLearner: other, already-decoded blocks (never the
+# query block itself). Offsets are (di, dj) relative to the query block.
+#
+# Spatial: causal neighbours in the current frame (left, top, top-left, top-right).
+_SPATIAL_OFFSETS = [(0, -1), (-1, 0), (-1, -1), (-1, 1)]
 
-# Fixed candidate offsets, in (di, dj) relative to the query block (i, j).
-# Spatial: causal neighbours in the CURRENT (in-progress) frame -- all
-# guaranteed already-decoded in raster order (di<0, or di==0 and dj<0).
-_SPATIAL_OFFSETS = [(0, -1), (-1, 0), (-1, -1), (-1, 1)]  # left, top, top-left, top-right
-# Temporal: neighbours in the PREVIOUS (fully reconstructed) frame -- any
-# position is valid there since the whole frame is already known, not just
-# a causal subset.
-_TEMPORAL_OFFSETS = [(0, 0), (-1, 0), (1, 0), (0, -1)]  # co-located, up, down, left
+# Temporal: neighbours in the previous, fully reconstructed frame (co-located,
+# above, below, left); any position is available there, not only causal ones.
+_TEMPORAL_OFFSETS = [(0, 0), (-1, 0), (1, 0), (0, -1)]
 
 N_SUPPORT = len(_SPATIAL_OFFSETS) + len(_TEMPORAL_OFFSETS)  # 8
 
 
 def get_support_set(canvas, prev_canvas, i, j, block_size):
     """
-    Assemble the few-shot in-context support set for query block (i, j):
-    up to 4 already-decoded spatial neighbours from `canvas` (the frame
-    currently being encoded/decoded) plus up to 4 neighbours from
-    `prev_canvas` (the previous frame, fully reconstructed already, or None
-    for the first frame of a sequence -- in which case all 4 temporal slots
-    are simply marked invalid and GBTICLMetaLearner falls back to its
-    learned "missing support" embedding for them, degrading gracefully to
-    spatial-only support).
+    Assemble the support set for query block (i, j): up to 4 spatial neighbours
+    from `canvas` and up to 4 temporal neighbours from `prev_canvas` (None for
+    the first frame, in which case the temporal slots are marked invalid).
 
-    Each support item's reference edge weights are computed directly from
-    ITS OWN true (already-decoded) pixels via
-    graph_model.reference_edge_weights() -- never transmitted, since encoder
-    and decoder each independently reconstruct the same pixels for any
-    already-decoded block, at the point they need them.
-
-    Returns a dict of stacked tensors, all length N_SUPPORT=8, on the same
-    device as `canvas`:
-        top, left:            (N_SUPPORT, block_size, 3) uint8
+    Returns a dict of tensors stacked over N_SUPPORT = 8 slots, on the canvas device:
+        top, left:             (N_SUPPORT, block_size, 3) uint8 context of each support block
         valid_top, valid_left: (N_SUPPORT,) bool
-        block:                (N_SUPPORT, block_size, block_size, 3) uint8
-                               -- the support block's own true pixels, for
-                               the caller to derive reference weights from
-                               (kept separate from graph_model to avoid a
-                               circular import between context.py and
-                               graph_model.py)
-        valid: (N_SUPPORT,) bool -- False for entirely-missing slots (off
-               top of the current frame, or no previous frame at all)
+        block:                 (N_SUPPORT, block_size, block_size, 3) uint8 pixels of each
+                               support block (the caller derives reference graphs from them)
+        valid:                 (N_SUPPORT,) bool, False for slots that fall outside the
+                               frame or have no previous frame
     """
     device = canvas.device
     H, W, _ = canvas.shape

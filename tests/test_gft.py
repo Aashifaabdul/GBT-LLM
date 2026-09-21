@@ -1,5 +1,5 @@
-"""GFT forward/inverse should be an exact round-trip (U is orthonormal by
-construction from eigh), for both the single-block and batched variants."""
+"""gft.py: forward/inverse graph Fourier transform is a round trip (U is
+orthonormal), for the single-block and batched variants."""
 
 import torch
 

@@ -1,9 +1,9 @@
-"""evaluate.py: psnr/bpp (existing, sanity only) + new ssim/bd_rate."""
+"""evaluate.py: PSNR, SSIM, BD-rate and LPIPS metrics."""
 
 import numpy as np
 import pytest
 
-from gbticl_pipeline.evaluate import psnr, ssim, bd_rate
+from gbticl_pipeline.evaluate import psnr, ssim, bd_rate, lpips
 
 
 def test_psnr_identical_images_is_infinite():
@@ -33,8 +33,7 @@ def test_bd_rate_identical_curves_is_near_zero():
 
 
 def test_bd_rate_strictly_better_curve_is_negative():
-    """A 'test' curve that achieves the SAME distortion at HALF the rate
-    everywhere should show a large negative (better) BD-Rate."""
+    """Halving the rate at equal distortion gives a BD-rate of about -50%."""
     dists = np.array([30.0, 35.0, 40.0, 45.0])
     rate_ref = np.array([1.0, 2.0, 4.0, 8.0])
     rate_test = rate_ref / 2.0
@@ -55,3 +54,25 @@ def test_bd_rate_requires_overlapping_distortion_ranges():
     dist_test = np.array([50.0, 52.0, 54.0, 56.0])
     with pytest.raises(ValueError):
         bd_rate(rates, dist_ref, rates, dist_test)
+
+
+def test_lpips_identical_images_is_zero():
+    img = np.random.default_rng(42).integers(0, 256, (64, 64, 3), dtype=np.uint8)
+    val = lpips(img, img)
+    assert val == pytest.approx(0.0, abs=1e-5)
+
+
+def test_lpips_distorted_image_is_higher():
+    rng = np.random.default_rng(42)
+    img = rng.integers(0, 256, (64, 64, 3), dtype=np.uint8)
+    noisy = np.clip(img.astype(int) + rng.normal(0, 30, img.shape), 0, 255).astype(np.uint8)
+    val = lpips(img, noisy)
+    assert val > 0.0
+
+
+def test_lpips_tensor_input_supported():
+    """lpips also accepts a (C, H, W) uint8 torch tensor."""
+    import torch
+    t = torch.randint(0, 256, (3, 64, 64), dtype=torch.uint8)
+    val = lpips(t, t)
+    assert val == pytest.approx(0.0, abs=1e-5)

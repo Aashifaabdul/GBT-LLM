@@ -1,13 +1,10 @@
-"""training.py's episodic meta-training step, exercised with synthetic
-in-memory data (no dependency on the real extracted-frame dataset being
-present) -- catches tensor-shape contract bugs like the one found during
-development (HFLoRACoeffModel.forward_sequence not supporting a real
-(B, n) batch, only used previously with a bare (n,) sequence)."""
+"""training.train_step_metalearner, run on synthetic batches so that no
+dataset is needed. Checks the tensor-shape contract, finite loss, and which
+modules receive gradients in each training stage."""
 
 import sys
 from pathlib import Path
 
-import pytest
 import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -40,8 +37,8 @@ def _synthetic_batch(b, device):
 
 
 def test_train_step_metalearner_stage_a_no_coeff_model(device):
-    """Stage A: GBT-ICL alone, coeff_net=None -- uses the LaplaceCoeffModel
-    closed-form rate proxy internally."""
+    """Stage A: graph model alone (coeff_net=None), with the closed-form
+    Laplace rate proxy."""
     gbticl_net = GBTICLMetaLearner(block_size=BLOCK_SIZE).to(device)
     batch = _synthetic_batch(4, device)
 
@@ -57,8 +54,7 @@ def test_train_step_metalearner_stage_a_no_coeff_model(device):
 
 
 def test_train_step_metalearner_stage_c_joint(device):
-    """Stage C-style joint step: both GBT-ICL and a trainable coeff model
-    receive gradients."""
+    """Stage C: joint training; both models receive gradients."""
     gbticl_net = GBTICLMetaLearner(block_size=BLOCK_SIZE).to(device)
     coeff_net = TinyTransformerCoeffModel(block_size=BLOCK_SIZE, symbol_range=WIDE_RANGE).to(device)
     batch = _synthetic_batch(4, device)
@@ -76,8 +72,8 @@ def test_train_step_metalearner_stage_c_joint(device):
 
 
 def test_train_step_metalearner_stage_b_frozen_gbticl(device):
-    """Stage B-style step: GBT-ICL frozen (requires_grad=False), only the
-    coefficient model's gradients should be nonzero."""
+    """Stage B: graph model frozen; only the coefficient model receives
+    gradients."""
     gbticl_net = GBTICLMetaLearner(block_size=BLOCK_SIZE).to(device)
     for p in gbticl_net.parameters():
         p.requires_grad_(False)

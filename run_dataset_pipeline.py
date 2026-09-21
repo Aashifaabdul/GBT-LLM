@@ -1,52 +1,37 @@
 """
-The full dissertation pipeline over real extracted frames: encode a whole
-sequence as a VIDEO (temporal support threaded frame-to-frame, YCbCr
-colour) with the real codec (GBT-ICL graph -> GFT -> quantize -> real range
-coder), decode it straight back, save each reconstructed frame, reassemble
-into a video, log per-frame Y-PSNR/Y-SSIM/bpp metrics, and (for models that
-predict a graph) save a predicted-graph figure.
+Run the codec over extracted frames and evaluate it.
 
-REQUIRES PyTorch. RUNTIME, READ BEFORE RUNNING ON FULL FRAMES: the range
-coder (real arithmetic coding, see range_coder.py) is an inherently
-sequential, per-symbol Python loop -- there is no way to GPU-parallelise it,
-by design (same reason every learned image/video codec does entropy coding
-on CPU). A full 1920x1080 frame is 32,400 8x8 blocks x 192 coefficients/
-block = ~6.2 million range-coder symbol calls, PER FRAME. Measured on this
-project's dev machine (RTX 5050 laptop): an UNTRAINED model at a 256x256
-crop (1024 blocks/frame) took ~140s to encode and ~800-1000s to decode ONE
-frame (decode is slower: TinyTransformerCoeffModel's symbol_probs has no
-KV-cache, see its class docstring; HFLoRACoeffModel does have one and is
-faster). By default this script center-crops every frame to --crop pixels
-(256 by default) so a run finishes in a reasonable time. Pass --full-frame
-to disable cropping once you've verified the pipeline works and have time
-to let it run (do this as a background/overnight job, and on a subset of
-frames via --max-frames first).
+A whole sequence is encoded as video (temporal support and coefficient
+conditioning carried from frame to frame, YCbCr colour) with the real codec
+(GBT-ICL graph -> GFT -> quantisation -> range coder), decoded again, and
+compared with the original. Per-frame Y-PSNR, Y-SSIM, RGB-PSNR and bits per pixel
+are written to metrics.csv, the reconstructed frames are saved and reassembled
+into a video, and a predicted-graph figure is saved for models that predict one.
 
-USAGE
-  # baseline (no training needed), quick sanity run:
+Range coding runs on the CPU, one symbol at a time, so a full 1920x1080 frame
+(32,400 blocks x 192 coefficients) takes a long time. By default every frame is
+centre-cropped to --crop pixels (256); use --full-frame to disable the crop and
+--max-frames to limit the number of frames.
+
+Examples:
+  # baselines, no training needed
   python run_dataset_pipeline.py --sequence Beauty --max-frames 3
 
-  # your trained model (legacy single-checkpoint form, GBTICLNet+TinyTransformer):
-  python run_dataset_pipeline.py --sequence Beauty --checkpoint checkpoints/gbticl_ckpt.pt
-
-  # named ablation configs (see ABLATION_CONFIGS below), for the SVG's own
-  # "Quality Metrics ... vs DCT baseline, vs non-adaptive GBT, vs GBT-ICL
-  # without LLM coefficient prediction" comparison:
+  # named configurations (see ABLATION_CONFIGS)
   python run_dataset_pipeline.py --sequence Beauty --ablation dct
   python run_dataset_pipeline.py --sequence Beauty --ablation nonadaptive_gbt
-  python run_dataset_pipeline.py --sequence Beauty --ablation gbticl_no_llm \
-      --gbticl-checkpoint checkpoints/net_trained.pt
   python run_dataset_pipeline.py --sequence Beauty --ablation metalearner_no_llm \
       --gbticl-checkpoint checkpoints/stageA.pt
   python run_dataset_pipeline.py --sequence Beauty --ablation full \
       --gbticl-checkpoint checkpoints/stageA.pt --coeff-checkpoint checkpoints/stageB.pt
 
-  # rate-distortion sweep in one run (writes one row per quant_step to
-  # ablation_summary.csv, needed for BD-Rate -- see evaluate.py::bd_rate):
-  python run_dataset_pipeline.py --sequence Beauty --ablation dct \
-      --quant-steps 2,4,8,16,32
+  # rate-distortion sweep (one row per quantisation step in ablation_summary.csv)
+  python run_dataset_pipeline.py --sequence Beauty --ablation dct --quant-steps 2,4,8,16,32
 
-  # both sequences, full resolution, all frames (slow -- see runtime note):
+  # legacy single checkpoint (GBTICLNet + TinyTransformerCoeffModel)
+  python run_dataset_pipeline.py --sequence Beauty --checkpoint checkpoints/gbticl_ckpt.pt
+
+  # both sequences at full resolution
   python run_dataset_pipeline.py --sequence both --full-frame
 """
 
@@ -63,10 +48,7 @@ try:
     import matplotlib.pyplot as plt
     from matplotlib.collections import LineCollection
 except ImportError as e:
-    raise SystemExit(
-        "run_dataset_pipeline.py needs PyTorch (+ matplotlib, already used "
-        f"elsewhere in this project). Not available in this environment: {e}"
-    )
+    raise SystemExit(f"run_dataset_pipeline.py requires PyTorch and matplotlib (import error: {e})")
 
 from PIL import Image
 
@@ -81,13 +63,13 @@ BLOCK_SIZE = 8
 DEFAULT_SYMBOL_RANGE = (-2200, 2200)
 DEFAULT_QUANT_STEP = 8.0
 
-# The SVG's own "Quality Metrics" box calls for exactly these comparisons:
-# PSNR/SSIM/BD-Rate/bpsp vs DCT baseline, vs non-adaptive GBT, vs GBT-ICL
-# without LLM coefficient prediction. This table maps each named config to
-# what it needs; "gbticl_no_llm" and "metalearner_no_llm" are the two
-# flavours of "without LLM coefficient prediction" (context-regressor vs.
-# meta-learner GBT-ICL respectively -- a bonus comparison beyond what the
-# SVG asks for, see graph_model.py's module docstring).
+
+# Named configurations and the checkpoints each one needs:
+#   dct                 fixed DCT basis, Laplace coefficient model
+#   nonadaptive_gbt     uniform-weight grid graph, Laplace coefficient model
+#   gbticl_no_llm       GBTICLNet checkpoint, Laplace coefficient model
+#   metalearner_no_llm  GBTICLMetaLearner checkpoint, Laplace coefficient model
+#   full                GBT-ICL checkpoint + coefficient-model checkpoint
 ABLATION_CONFIGS = {
     "dct": dict(needs_gbticl_ckpt=False, needs_coeff_ckpt=False),
     "nonadaptive_gbt": dict(needs_gbticl_ckpt=False, needs_coeff_ckpt=False),
@@ -98,8 +80,7 @@ ABLATION_CONFIGS = {
 
 
 def center_crop(img, size):
-    """Crop img (H,W,3) to a centered size x size region, snapped to a
-    multiple of BLOCK_SIZE (the codec requires this)."""
+    """Centre-crop img (H, W, 3) to a size x size region aligned to the block grid."""
     h, w = img.shape[:2]
     size = (size // BLOCK_SIZE) * BLOCK_SIZE
     size = min(size, (h // BLOCK_SIZE) * BLOCK_SIZE, (w // BLOCK_SIZE) * BLOCK_SIZE)
@@ -111,8 +92,7 @@ def center_crop(img, size):
 
 
 def to_block_multiple(img):
-    """If not cropping, still need H,W to be multiples of BLOCK_SIZE (codec
-    asserts this) -- trim at most BLOCK_SIZE-1 px off the bottom/right."""
+    """Trim the bottom/right edge so height and width are multiples of BLOCK_SIZE."""
     h, w = img.shape[:2]
     h2 = (h // BLOCK_SIZE) * BLOCK_SIZE
     w2 = (w // BLOCK_SIZE) * BLOCK_SIZE
@@ -120,15 +100,15 @@ def to_block_multiple(img):
 
 
 def load_models(checkpoint_path, device):
-    """Legacy loader (single --checkpoint, GBTICLNet+TinyTransformerCoeffModel
-    only): returns (gbticl_model, coeff_model, quant_step, symbol_range, label).
-    Kept unchanged for backward compatibility; --ablation (below) is the
-    newer, more general path covering all 5 named configs."""
+    """
+    Load the legacy single-checkpoint pair (GBTICLNet + TinyTransformerCoeffModel).
+
+    Without a checkpoint the non-learned baselines are used. Returns
+    (gbticl_model, coeff_model, quant_step, symbol_range, label).
+    """
     if checkpoint_path is None:
         print("No --checkpoint given: using the non-learned baselines "
-              "(ContextGradientGBTICL + LaplaceCoeffModel). Results reflect the "
-              "hand-written heuristics, not a trained model -- pass --checkpoint "
-              "once training.py has produced one.")
+              "(ContextGradientGBTICL + LaplaceCoeffModel)")
         gbticl_model = ContextGradientGBTICL().to(device)
         coeff_model = LaplaceCoeffModel().to(device)
         return gbticl_model, coeff_model, DEFAULT_QUANT_STEP, DEFAULT_SYMBOL_RANGE, "baseline"
@@ -152,10 +132,7 @@ def load_models(checkpoint_path, device):
 
 
 def load_gbticl_for_ablation(gbticl_checkpoint, device):
-    """Loads a GBT-ICL model from a training.py checkpoint, auto-detecting
-    GBTICLNet vs GBTICLMetaLearner from the checkpoint's own
-    gbticl_model_type field (old checkpoints predate this key -> assume
-    'net', training.py's original/default architecture)."""
+    """Load a GBT-ICL model from a training.py checkpoint; the model class is read from the checkpoint."""
     ckpt = torch.load(gbticl_checkpoint, map_location=device, weights_only=False)
     model_type = ckpt.get("gbticl_model_type", "net")
     block_size = ckpt.get("block_size", BLOCK_SIZE)
@@ -167,9 +144,7 @@ def load_gbticl_for_ablation(gbticl_checkpoint, device):
 
 
 def load_coeff_for_ablation(coeff_checkpoint, base_model_name, symbol_range, device):
-    """Loads a coefficient model from a training.py checkpoint, auto-
-    detecting TinyTransformerCoeffModel vs HFLoRACoeffModel from the
-    checkpoint's coeff_model_type field."""
+    """Load a coefficient model from a training.py checkpoint; the model class is read from the checkpoint."""
     ckpt = torch.load(coeff_checkpoint, map_location=device, weights_only=False)
     coeff_type = ckpt.get("coeff_model_type", "tiny")
     block_size = ckpt.get("block_size", BLOCK_SIZE)
@@ -187,9 +162,12 @@ def load_coeff_for_ablation(coeff_checkpoint, base_model_name, symbol_range, dev
 
 def load_models_for_ablation(ablation, gbticl_checkpoint, coeff_checkpoint, base_model_name,
                               symbol_range, device):
-    """Returns (gbticl_model_or_None, coeff_model, fixed_basis) for one of
-    ABLATION_CONFIGS' 5 named configs. gbticl_model is None only for "dct"
-    (fixed_basis=True -- codec.py ignores gbticl_model entirely in that case)."""
+    """
+    Build the models of one named configuration.
+
+    Returns (gbticl_model or None, coeff_model, fixed_basis); gbticl_model is None
+    only for "dct", where the codec uses the fixed basis instead.
+    """
     if ablation not in ABLATION_CONFIGS:
         raise SystemExit(f"unknown --ablation {ablation!r}, choose from {list(ABLATION_CONFIGS)}")
     cfg = ABLATION_CONFIGS[ablation]
@@ -216,10 +194,7 @@ def load_models_for_ablation(ablation, gbticl_checkpoint, coeff_checkpoint, base
 
 def estimate_runtime(gbticl_model, coeff_model, quant_step, symbol_range, sample_img, device, n_frames,
                       fixed_basis=False):
-    """Time-encode a single sample frame's worth of work isn't cheap either,
-    so just time ONE block's full encode+decode via a 1-block crop, then
-    extrapolate. Rough estimate only -- printed so you can Ctrl-C before
-    committing to an accidentally huge run."""
+    """Time one block (encode + decode) and print the extrapolated total runtime."""
     tiny = sample_img[:BLOCK_SIZE, :BLOCK_SIZE, :]
     t0 = time.time()
     payload, meta = encode_image(tiny, block_size=BLOCK_SIZE, quant_step=quant_step,
@@ -234,18 +209,18 @@ def estimate_runtime(gbticl_model, coeff_model, quant_step, symbol_range, sample
     print(f"runtime estimate: ~{per_block*1000:.0f} ms/block x {n_blocks} blocks/frame x "
           f"{n_frames} frames ~= {est_seconds/60:.1f} min total (rough; real runs vary)")
     if est_seconds > 1800:
-        print("  -> that's over 30 min. Consider a smaller --crop, fewer --max-frames, "
-              "or running this as a background job.")
+        print("  -> over 30 minutes; consider a smaller --crop or fewer --max-frames")
 
 
 def save_graph_figure(gbticl_model, img, out_path, device, title_suffix=""):
-    """Predicted-graph sanity figure for one representative (high-variance)
-    block of `img`, using whatever model actually produced the results in
-    this run -- same visual language as visualize_graph.py, but driven by
-    the real model instead of the numpy heuristic reimplementation."""
+    """Save a figure of the graph predicted for the highest-variance block of `img`."""
     bs = BLOCK_SIZE
     h, w = img.shape[:2]
     n_bh, n_bw = h // bs, w // bs
+
+    if n_bh < 2 or n_bw < 2:
+        print("skipping predicted-graph figure: image is smaller than a 2x2 block grid")
+        return
     best, best_var = (1, 1), -1.0
     for bi in range(1, n_bh):
         for bj in range(1, n_bw):
@@ -264,7 +239,7 @@ def save_graph_figure(gbticl_model, img, out_path, device, title_suffix=""):
     with torch.no_grad():
         weights = gbticl_model.predict_edge_weights(top_t, left_t, True, True, bs)
     weights = weights.detach().cpu().numpy()
-    weights_norm = weights / max(weights.max(), 1e-8)  # visual scale only
+    weights_norm = weights / max(weights.max(), 1e-8)  # scaled for display only
 
     edges = edge_list(bs)
     fig, ax = plt.subplots(figsize=(5.5, 5.5))
@@ -290,18 +265,20 @@ def save_graph_figure(gbticl_model, img, out_path, device, title_suffix=""):
 
 
 def make_concat_file(frame_paths, list_path, fps):
+    """Write an ffmpeg concat-demuxer list for the given frames."""
     duration = 1.0 / fps
     with open(list_path, "w") as f:
         for p in frame_paths:
             f.write(f"file '{p.name}'\n")
             f.write(f"duration {duration}\n")
-        # ffmpeg's concat demuxer needs the last file repeated (its duration is
-        # otherwise ignored) -- documented ffmpeg quirk, not a bug here.
+
+        # The concat demuxer ignores the duration of the last entry unless it is repeated
         if frame_paths:
             f.write(f"file '{frame_paths[-1].name}'\n")
 
 
 def reassemble_video(frame_dir, out_mp4, fps):
+    """Assemble the PNG frames of a directory into an MP4 with ffmpeg (skipped if ffmpeg is missing)."""
     frame_paths = sorted(frame_dir.glob("*.png"))
     if not frame_paths:
         print(f"  (no frames in {frame_dir}, skipping video)")
@@ -315,11 +292,7 @@ def reassemble_video(frame_dir, out_mp4, fps):
     try:
         result = subprocess.run(cmd, capture_output=True, text=True)
     except FileNotFoundError:
-        print(f"  ffmpeg not found on PATH -- skipping video assembly for {out_mp4}. "
-              f"Frames are still saved in {frame_dir}/. Install ffmpeg (Windows: "
-              f"`winget install ffmpeg` or download from ffmpeg.org and add its bin/ "
-              f"folder to PATH, then re-run) and this step will work without "
-              f"re-encoding anything.")
+        print(f"  ffmpeg not found on PATH; skipping {out_mp4} (frames remain in {frame_dir}/)")
         return
     if result.returncode != 0:
         print(f"  ffmpeg failed for {out_mp4}:\n{result.stderr[-2000:]}")
@@ -329,12 +302,13 @@ def reassemble_video(frame_dir, out_mp4, fps):
 
 def process_sequence(seq_name, frames_dir, out_root, gbticl_model, coeff_model,
                       quant_step, symbol_range, device, crop, max_frames, fps, fixed_basis=False):
-    """Encodes the whole sequence as one VIDEO (encode_video/decode_video --
-    temporal support threaded frame-to-frame for models that use it, YCbCr
-    colour so headline metrics are Y-PSNR/Y-SSIM, literature-comparable),
-    not independent per-frame images. Returns the list of per-frame metric
-    dicts (also written to metrics.csv) so callers building an ablation
-    summary (main(), below) don't need to re-read the CSV back."""
+    """
+    Encode, decode and evaluate one sequence as a video.
+
+    Writes metrics.csv, the reconstructed and original (cropped) frames and the
+    reassembled videos under out_root/<seq_name>, and returns the list of
+    per-frame metric dicts.
+    """
     frame_paths = sorted(Path(frames_dir).glob("*.png"))
     if max_frames:
         frame_paths = frame_paths[:max_frames]
@@ -348,6 +322,7 @@ def process_sequence(seq_name, frames_dir, out_root, gbticl_model, coeff_model,
     recon_dir.mkdir(parents=True, exist_ok=True)
     orig_dir.mkdir(parents=True, exist_ok=True)
 
+    # Crop and convert to YCbCr
     imgs_rgb = []
     for fp in frame_paths:
         img = np.array(Image.open(fp).convert("RGB"))
@@ -372,6 +347,7 @@ def process_sequence(seq_name, frames_dir, out_root, gbticl_model, coeff_model,
     t2 = time.time()
     print(f"[{seq_name}] encode_video: {t1-t0:.1f}s total, decode_video: {t2-t1:.1f}s total")
 
+    # Per-frame metrics
     rows = []
     for idx, (fp, img_rgb, img_ycbcr, payload, meta, recon_ycbcr) in enumerate(
         zip(frame_paths, imgs_rgb, imgs_ycbcr, payloads, metas, recon_ycbcr_frames)
@@ -381,7 +357,7 @@ def process_sequence(seq_name, frames_dir, out_root, gbticl_model, coeff_model,
         try:
             y_ssim = ssim(img_ycbcr[..., 0], recon_ycbcr[..., 0])
         except ImportError:
-            y_ssim = float("nan")  # scikit-image not installed -- degrade gracefully, don't crash the run
+            y_ssim = float("nan")  # scikit-image not installed
         rgb_psnr = psnr(img_rgb, recon_rgb)
         bpp = bits_per_pixel(payload, meta["H"], meta["W"])
 
@@ -405,7 +381,7 @@ def process_sequence(seq_name, frames_dir, out_root, gbticl_model, coeff_model,
     reassemble_video(recon_dir, seq_out / "reconstructed_video.mp4", fps)
     reassemble_video(orig_dir, seq_out / "original_video.mp4", fps)
 
-    if gbticl_model is not None:  # skipped for the DCT baseline -- no graph to visualise
+    if gbticl_model is not None:  # the DCT baseline has no predicted graph
         fig_path = out_root / "figures" / f"{seq_name}_predicted_graph.png"
         save_graph_figure(gbticl_model, imgs_rgb[0], fig_path, device, title_suffix=f" -- {seq_name}")
 
@@ -413,18 +389,14 @@ def process_sequence(seq_name, frames_dir, out_root, gbticl_model, coeff_model,
 
 
 def _append_ablation_summary(out_dir, ablation, seq_name, quant_step, rows):
-    """Aggregates one process_sequence() run's per-frame rows into one
-    summary row (mean Y-PSNR/Y-SSIM/bpp across frames) and appends it to
-    results/ablation_summary.csv -- the file visualize_metrics.py's
-    --compare-all reads to build the SVG's rate-distortion plots + BD-Rate
-    table across all configs/sequences/quant_steps in one place."""
+    """Append the mean Y-PSNR / Y-SSIM / bpp of one run to <out_dir>/ablation_summary.csv."""
     if not rows:
         return
     summary_path = Path(out_dir) / "ablation_summary.csv"
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     mean_bpp = float(np.mean([r["bpp"] for r in rows]))
     mean_y_psnr = float(np.mean([r["y_psnr_db"] for r in rows]))
-    y_ssims = [r["y_ssim"] for r in rows if r["y_ssim"] == r["y_ssim"]]  # drop NaN (skimage missing)
+    y_ssims = [r["y_ssim"] for r in rows if r["y_ssim"] == r["y_ssim"]]  # drop NaN
     mean_y_ssim = float(np.mean(y_ssims)) if y_ssims else float("nan")
     mean_rgb_psnr = float(np.mean([r["rgb_psnr_db"] for r in rows]))
 
@@ -444,31 +416,30 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--sequence", choices=["Beauty", "HoneyBee", "both"], default="both")
     ap.add_argument("--checkpoint", type=str, default=None,
-                     help="Legacy single-checkpoint form (GBTICLNet+TinyTransformerCoeffModel only). "
-                          "Omit (and omit --ablation) to use the non-learned baselines.")
+                     help="Legacy single checkpoint (GBTICLNet + TinyTransformerCoeffModel). "
+                          "Omit it and --ablation to use the non-learned baselines.")
     ap.add_argument("--ablation", choices=list(ABLATION_CONFIGS), default=None,
-                     help="Named ablation config -- see ABLATION_CONFIGS / the module docstring's USAGE "
-                          "section. Takes precedence over --checkpoint if both are given.")
+                     help="Named configuration (see ABLATION_CONFIGS); takes precedence over --checkpoint.")
     ap.add_argument("--gbticl-checkpoint", type=str, default=None,
                      help="GBT-ICL checkpoint for --ablation gbticl_no_llm/metalearner_no_llm/full.")
     ap.add_argument("--coeff-checkpoint", type=str, default=None,
                      help="Coefficient-model checkpoint for --ablation full.")
     ap.add_argument("--base-model-name", type=str, default="distilgpt2",
-                     help="Fallback base LM name if the coeff checkpoint doesn't record one.")
+                     help="Base language model, used if the coefficient checkpoint does not record one.")
     ap.add_argument("--out-dir", type=str, default="results")
     ap.add_argument("--crop", type=int, default=256,
-                     help="Center-crop size (px, multiple of 8) applied to every frame. 0/omit with "
-                          "--full-frame to disable.")
-    ap.add_argument("--full-frame", action="store_true", help="Disable cropping -- see runtime note above.")
+                     help="Centre-crop size in pixels (multiple of 8) applied to every frame.")
+    ap.add_argument("--full-frame", action="store_true", help="Disable cropping.")
+    ap.add_argument("--frames-dir", type=str, default=None,
+                     help="Frame directory (default: data/<sequence>/frames). Use it with --full-frame "
+                          "to encode downscaled frames from preprocessing/resize_frames.py.")
     ap.add_argument("--max-frames", type=int, default=None, help="Limit frames processed per sequence.")
     ap.add_argument("--fps", type=float, default=5.0, help="Frame rate for the reassembled video.")
     ap.add_argument("--quant-steps", type=str, default=None,
-                     help="Comma-separated quant_step sweep (e.g. '2,4,8,16,32') for a rate-distortion "
-                          "curve in one run -- appends one row per value to ablation_summary.csv. "
-                          "Overrides --quant-step / the checkpoint's stored quant_step.")
+                     help="Comma-separated quantisation steps (e.g. 2,4,8,16,32); one row per step is "
+                          "appended to ablation_summary.csv. Overrides --quant-step.")
     ap.add_argument("--quant-step", type=float, default=None,
-                     help="Single quant_step, if not sweeping. Defaults to the checkpoint's own "
-                          "(legacy path) or DEFAULT_QUANT_STEP (ablation path).")
+                     help="Quantisation step (default: the checkpoint's own, else 8).")
     ap.add_argument("--symbol-lo", type=int, default=DEFAULT_SYMBOL_RANGE[0])
     ap.add_argument("--symbol-hi", type=int, default=DEFAULT_SYMBOL_RANGE[1])
     args = ap.parse_args()
@@ -500,12 +471,15 @@ def main():
     crop = None if args.full_frame else args.crop
     out_root = script_dir / args.out_dir / label
     sequences = ["Beauty", "HoneyBee"] if args.sequence == "both" else [args.sequence]
+    if args.frames_dir and args.sequence == "both":
+        raise SystemExit("--frames-dir only makes sense with a single --sequence (it's a per-sequence dir)")
 
     for quant_step in quant_steps:
         print(f"\n=== quant_step={quant_step} ===")
         for seq in sequences:
+            frames_dir = Path(args.frames_dir) if args.frames_dir else script_dir / "data" / seq / "frames"
             rows = process_sequence(
-                seq, script_dir / seq / "frames", out_root,
+                seq, frames_dir, out_root,
                 gbticl_model, coeff_model, quant_step, symbol_range, device,
                 crop, args.max_frames, args.fps, fixed_basis=fixed_basis,
             )
@@ -513,7 +487,7 @@ def main():
                 _append_ablation_summary(script_dir / args.out_dir, args.ablation, seq, quant_step, rows)
 
     print(f"\nall done. Results under: {out_root}")
-    print(f"Next: python visualize_metrics.py --results-dir {args.out_dir}/{label}")
+    print(f"Next: python visualization/visualize_metrics.py --results-dir {args.out_dir}/{label}")
 
 
 if __name__ == "__main__":

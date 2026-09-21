@@ -1,13 +1,10 @@
-"""Shared pytest fixtures: makes gbticl_pipeline importable regardless of
-which directory pytest is invoked from, and exposes the project's own
-device-selection logic so tests run on GPU when available (matching how the
-codec actually runs) without hardcoding 'cuda' anywhere in the test files."""
+"""Shared fixtures: put the repo root on sys.path and provide a `device`
+fixture using the project's own get_device() (GPU if available, else CPU)."""
 
 import sys
 from pathlib import Path
 
 import pytest
-import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:

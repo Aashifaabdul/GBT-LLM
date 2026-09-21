@@ -1,4 +1,21 @@
+"""End-to-end round-trip check of the GBT codec on a small crop.
+
+Encodes and decodes a 64x64 crop of data/Beauty/frames/frame0000.png with
+gbticl_pipeline.codec (ContextGradientGBTICL graph model, LaplaceCoeffModel
+coefficient model, 8x8 blocks) at two quantisation steps: 1 (near-lossless) and
+8 (lossy). Prints encode/decode time, payload size, bpp, PSNR and, for the
+lossy run, the compression ratio against raw 24-bit RGB. The original crop and
+the q=8 reconstruction are saved to results/codec_smoke_check/. Takes no
+command-line arguments and runs on import.
+
+Usage:
+    python evaluation/codec_smoke_check.py
+"""
 import time
+import sys
+from pathlib import Path
+ROOT_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT_DIR))
 from pathlib import Path
 
 import numpy as np
@@ -11,29 +28,29 @@ from gbticl_pipeline.graph_model import ContextGradientGBTICL
 from gbticl_pipeline.coeff_model import LaplaceCoeffModel
 from gbticl_pipeline.device_utils import get_device
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+SCRIPT_DIR = ROOT_DIR / "results" / "codec_smoke_check"
+SCRIPT_DIR.mkdir(parents=True, exist_ok=True)
 
 device = get_device()
 print(f"running on device: {device}  (cuda available: {torch.cuda.is_available()})")
 
-img_path = SCRIPT_DIR / "Beauty" / "frames" / "frame0000.png"
+img_path = ROOT_DIR / "data" / "Beauty" / "frames" / "frame0000.png"
 full = np.array(Image.open(img_path).convert("RGB"))
 print("full frame shape:", full.shape)
 
-# small crop for a fast, honest correctness test (full 1920x1080 in a per-symbol
-# Python entropy-coding loop is far too slow for this environment's runtime
-# limits regardless of device -- see the codec.py docstring on the CPU-bound
-# range-coding step)
-crop = full[200:264, 300:364, :]  # 64x64 -> 8x8 blocks of 8x8 = 64 blocks
+
+# A small crop keeps the run short: range coding is a sequential per-symbol
+# loop on the CPU (see the gbticl_pipeline.codec docstring).
+crop = full[200:264, 300:364, :]  # 64x64 pixels = 8x8 grid of 8x8 blocks
 print("crop shape:", crop.shape)
 Image.fromarray(crop).save(SCRIPT_DIR / "test_crop_original.png")
 
 gbticl_model = ContextGradientGBTICL().to(device)
 coeff_model = LaplaceCoeffModel().to(device)
 
-# DC-like (low-eigenvalue) coefficients can reach roughly +-255*sqrt(64)=2040
-# before quantization, so the symbol range needs to cover that at fine quant
-# steps -- widen it here rather than at the tighter default.
+
+# Low-frequency (DC-like) coefficients reach about +-255*sqrt(64) = 2040 before
+# quantisation, so at fine steps the coder's symbol range must cover them.
 WIDE_RANGE = (-2200, 2200)
 
 print("\n=== TEST 1: near-lossless path (fine quant step) ===")

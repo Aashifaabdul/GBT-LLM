@@ -1,25 +1,25 @@
+"""Summary figures and tables from the metrics written by run_dataset_pipeline.py.
+
+Per-sequence mode (--results-dir): reads <results-dir>/<Sequence>/metrics.csv and writes to
+<results-dir>/figures (or --out): psnr_per_frame.png, bpp_per_frame.png, rate_distortion.png
+(optionally overlaying the runs of --compare) and summary.csv.
+
+Ablation mode (--compare-all): reads results/ablation_summary.csv (one row per ablation,
+sequence and quantisation step), plots one rate-distortion figure per sequence with one curve per
+ablation config and writes bd_rate_table.csv (BD-Rate against --bd-rate-reference). BD-Rate needs
+at least 4 points per curve, i.e. a --quant-steps sweep in run_dataset_pipeline.py (see
+gbticl_pipeline/evaluate.py::bd_rate).
+
+Usage:
+  python visualization/visualize_metrics.py --results-dir results/full
+  python visualization/visualize_metrics.py --results-dir results/full --compare results/dct
+  python visualization/visualize_metrics.py --compare-all results/ablation_summary.csv
 """
-Read the metrics.csv files produced by run_dataset_pipeline.py (one per
-sequence) and produce the summary figures for your dissertation results
-section: PSNR per frame, bits-per-pixel per frame, and a rate-distortion
-scatter across all sequences.
-
-No PyTorch needed -- pure pandas/matplotlib/numpy, so (unlike training.py
-and run_dataset_pipeline.py) this one WAS actually executed and verified in
-this environment, against a synthetic metrics.csv, before being handed to
-you. See the bottom of this file's accompanying README section for how that
-was checked.
-
-USAGE
-  python visualize_metrics.py --results-dir results/trained
-  python visualize_metrics.py --results-dir results/baseline --compare results/trained
-
-  # ablation matrix: overlay every --ablation config's rate-distortion curve
-  # (one plot per sequence) + a BD-Rate table, from run_dataset_pipeline.py's
-  # results/ablation_summary.csv (needs a --quant-steps sweep per config for
-  # BD-Rate's >=4-points-per-curve requirement -- see evaluate.py::bd_rate):
-  python visualize_metrics.py --compare-all results/ablation_summary.csv
-"""
+import sys
+from pathlib import Path
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 import argparse
 import csv
@@ -34,12 +34,11 @@ def _to_float_or_inf(s):
 
 
 def read_metrics(csv_path):
-    """Reads a per-sequence metrics.csv from process_sequence(). Handles
-    both the current column names (y_psnr_db/y_ssim/rgb_psnr_db, video-mode
-    -- no per-frame encode_s/decode_s since encode_video/decode_video time
-    the whole sequence, not frame-by-frame) and the older per-image-mode
-    columns (psnr_db/encode_s/decode_s), so plots still work on results from
-    either version of run_dataset_pipeline.py."""
+    """Read a per-sequence metrics.csv written by process_sequence().
+
+    Accepts the current columns (frame, bpp, y_psnr_db, y_ssim, rgb_psnr_db; no per-frame timings,
+    because the video codec times the whole sequence) and the older per-image columns
+    (psnr_db, encode_s, decode_s). Missing values become NaN or inf (lossless PSNR)."""
     rows = []
     with open(csv_path, newline="") as f:
         for row in csv.DictReader(f):
@@ -57,7 +56,7 @@ def read_metrics(csv_path):
 
 
 def find_sequence_metrics(results_dir):
-    """results_dir/<Sequence>/metrics.csv for every sequence present."""
+    """Return {sequence name: rows} for every <results_dir>/<Sequence>/metrics.csv."""
     results_dir = Path(results_dir)
     out = {}
     for seq_dir in sorted(results_dir.iterdir()):
@@ -68,6 +67,7 @@ def find_sequence_metrics(results_dir):
 
 
 def summarize(rows):
+    """Mean PSNR (finite frames only), bpp and encode/decode times of one sequence."""
     finite = [r["psnr_db"] for r in rows if r["psnr_db"] != float("inf")]
     bpps = [r["bpp"] for r in rows]
     return dict(
@@ -80,6 +80,7 @@ def summarize(rows):
 
 
 def plot_per_frame(all_metrics, out_path, ylabel_key, title, ylabel):
+    """Line plot of one metric (row key ylabel_key) against frame index, one line per sequence."""
     fig, ax = plt.subplots(figsize=(9, 4.5))
     for seq, rows in all_metrics.items():
         finite_rows = [(i, r[ylabel_key]) for i, r in enumerate(rows) if r[ylabel_key] != float("inf")]
@@ -100,6 +101,7 @@ def plot_per_frame(all_metrics, out_path, ylabel_key, title, ylabel):
 
 
 def plot_rate_distortion(all_metrics, out_path, compare_metrics=None, compare_label="compare"):
+    """Scatter of per-frame (bpp, PSNR); compare_metrics are drawn as crosses."""
     fig, ax = plt.subplots(figsize=(6, 6))
     for seq, rows in all_metrics.items():
         pts = [(r["bpp"], r["psnr_db"]) for r in rows if r["psnr_db"] != float("inf")]
@@ -125,6 +127,7 @@ def plot_rate_distortion(all_metrics, out_path, compare_metrics=None, compare_la
 
 
 def write_summary_table(all_metrics, out_path):
+    """Write one summary row per sequence to out_path and print the same numbers."""
     with open(out_path, "w") as f:
         f.write("sequence,n_frames,mean_psnr_db,mean_bpp,mean_encode_s,mean_decode_s\n")
         for seq, rows in all_metrics.items():
@@ -140,10 +143,11 @@ def write_summary_table(all_metrics, out_path):
 
 
 def read_ablation_summary(csv_path):
-    """Reads run_dataset_pipeline.py's results/ablation_summary.csv (one row
-    per ablation/sequence/quant_step, written by _append_ablation_summary).
-    Returns dict[(ablation, sequence)] -> list of row dicts, sorted by
-    quant_step (equivalently, by bpp -- finer quant_step means lower bpp)."""
+    """Read run_dataset_pipeline.py's ablation_summary.csv (one row per ablation, sequence and
+    quant_step, appended by _append_ablation_summary).
+
+    Returns {(ablation, sequence): rows} with each list sorted by quant_step (a larger step
+    gives a lower bpp)."""
     rows_by_key = {}
     with open(csv_path, newline="") as f:
         for row in csv.DictReader(f):
@@ -160,10 +164,8 @@ def read_ablation_summary(csv_path):
 
 
 def plot_ablation_rate_distortion(rows_by_key, out_dir):
-    """One rate-distortion plot per sequence, one curve per ablation config
-    -- directly produces the SVG's own 'Quality Metrics: PSNR/SSIM/BD-Rate/
-    bpsp vs DCT baseline, vs non-adaptive GBT, vs GBT-ICL without LLM
-    coefficient prediction' comparison."""
+    """One rate-distortion plot per sequence with one curve per ablation config
+    (DCT baseline, non-adaptive GBT, GBT-ICL without LLM, full model)."""
     sequences = sorted(set(seq for _, seq in rows_by_key))
     for seq in sequences:
         fig, ax = plt.subplots(figsize=(7, 6))
@@ -190,10 +192,10 @@ def plot_ablation_rate_distortion(rows_by_key, out_dir):
 
 
 def write_bd_rate_table(rows_by_key, out_path, reference="dct"):
-    """BD-Rate (evaluate.py::bd_rate) of every ablation config vs `reference`
-    (DCT baseline, per the SVG's own comparison), per sequence. Needs >=4
-    quant_step points per curve -- configs with fewer are skipped with a
-    printed note rather than crashing the whole report."""
+    """Write the BD-Rate (gbticl_pipeline.evaluate.bd_rate, PSNR-based) of every ablation config
+    against `reference`, per sequence.
+
+    Curves with fewer than 4 quant_step points are skipped with a printed note."""
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from gbticl_pipeline.evaluate import bd_rate
@@ -232,6 +234,7 @@ def write_bd_rate_table(rows_by_key, out_path, reference="dct"):
 
 
 def main():
+    """Parse the command line and write the per-sequence or ablation outputs."""
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--results-dir", type=str, default=None,
                      help="e.g. results/trained (must contain <Sequence>/metrics.csv)")
@@ -242,8 +245,7 @@ def main():
                           "rate-distortion curve (one plot per sequence) + a BD-Rate table vs the DCT "
                           "baseline. Mutually exclusive with --results-dir.")
     ap.add_argument("--bd-rate-reference", type=str, default="dct",
-                     help="Ablation name to use as the BD-Rate anchor (default: dct, per the SVG's "
-                          "own 'vs DCT baseline' comparison).")
+                     help="Ablation name to use as the BD-Rate anchor (default: dct).")
     ap.add_argument("--out", type=str, default=None,
                      help="Defaults to <results-dir>/figures, or the ablation_summary.csv's own "
                           "directory / 'figures' for --compare-all.")

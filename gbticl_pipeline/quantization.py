@@ -1,14 +1,13 @@
-"""Scalar quantization of GFT coefficients. Elementwise ops -- run on whatever
-device `coeffs`/`q` already live on."""
+"""Uniform scalar quantisation of GFT coefficients."""
 
 import torch
 
 
 def quantize(coeffs, step):
-    """x̂_q = round(x̂ / step). Lossy for step > 0; step -> 0 approaches lossless."""
+    """q = round(coeffs / step), as int64."""
     return torch.round(coeffs / step).to(torch.int64)
 
 
 def dequantize(q, step):
-    """x̂_approx = x̂_q * step."""
+    """Reconstruction coeffs ≈ q * step, as float64."""
     return q.to(torch.float64) * step

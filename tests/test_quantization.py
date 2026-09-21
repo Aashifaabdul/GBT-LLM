@@ -1,3 +1,4 @@
+"""quantization.py: uniform scalar quantiser and dequantiser."""
 import torch
 
 from gbticl_pipeline.quantization import quantize, dequantize
@@ -19,8 +20,7 @@ def test_quantize_dtype_is_integral():
 
 
 def test_quantize_zero_step_free_passthrough_semantics():
-    # step -> small approaches lossless: with a small enough step, dequantize
-    # should recover the original to within that step's resolution
+    # a small step gives near-lossless reconstruction, within one step
     coeffs = torch.tensor([3.3, -7.7, 0.0], dtype=torch.float64)
     step = 0.01
     q = quantize(coeffs, step)

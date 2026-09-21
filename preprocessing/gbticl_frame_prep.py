@@ -1,23 +1,28 @@
-"""
-GBT-ICL pipeline — Stage 0/1 data prep: frame extraction + block partitioning.
+"""Frame extraction and block partitioning of the raw 1080p test sequences.
 
-Stage 0 (this script, part A): read raw planar 4:2:0 8-bit YUV video, convert
-to RGB, and uniformly sample N frames per sequence so the still-image test set
-covers the sequence's visual variation (rather than N near-duplicate frames
-from a 120fps slow-motion clip).
+Reads the raw planar 4:2:0 (I420) 8-bit YUV files of Beauty and HoneyBee,
+samples NUM_FRAMES uniformly spaced frames per sequence (so the still-image set
+covers the variation of the 120 fps clip rather than near-duplicate frames),
+converts them to RGB (BT.601) and, for each frame, writes under
+data/<sequence>/ (or $GBTICL_OUT_ROOT/<sequence>/):
+  frames/frameNNNN.png                  RGB frame
+  blocks/frameNNNN_blocks_8x8.npy       block tensor (n_bh, n_bw, 8, 8, 3), uint8
+  block_overlay/frameNNNN_grid.png      frame with the block grid drawn in red
+Existing outputs are skipped, so an interrupted run can be resumed.
 
-Stage 1 (this script, part B): partition each sampled frame into non-overlapping
-N x N pixel blocks (the "Block Partition" stage in gbticl_architecture.svg),
-saving both the block tensor (for the downstream Context Extraction / GBT-ICL
-model) and a visual grid overlay for sanity-checking.
+The raw YUV files are looked for in the parent of the repository folder, or in
+$GBTICL_DATASET_ROOT (layout in the CONFIG block). SEQUENCES, NUM_FRAMES and
+BLOCK_SIZE are set in the CONFIG block rather than on the command line.
 
 Usage:
-    python3 gbticl_frame_prep.py
-
-Config is set in the CONFIG block below — edit SEQUENCES / NUM_FRAMES /
-BLOCK_SIZE as needed rather than passing CLI flags, to keep this reproducible
-as a single documented artifact for the dissertation.
+    python preprocessing/gbticl_frame_prep.py [Beauty|HoneyBee]
 """
+import sys
+from pathlib import Path
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 
 import os
 from pathlib import Path
@@ -25,21 +30,21 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+
 # ----------------------------- CONFIG ---------------------------------------
-
 WIDTH, HEIGHT = 1920, 1080
-NUM_FRAMES = 30          # frames sampled per sequence (see rationale in README note below)
-BLOCK_SIZE = 8           # N x N block partition size (matches GFT baseline granularity)
+NUM_FRAMES = 30  # frames sampled per sequence
+BLOCK_SIZE = 8  # N x N block partition size (matches GFT baseline granularity)
 
-# Resolved relative to this script's own location, so it works on any machine
-# without editing paths by hand. Layout expected:
+
+# Paths are resolved relative to the repository. Expected layout of the raw input:
 #   <DATASET_ROOT>/Beauty_1920x1080_120fps_420_8bit_YUV_RAW (1)/Beauty_..._YUV.yuv
 #   <DATASET_ROOT>/HoneyBee_1920x1080_120fps_420_8bit_YUV_RAW/HoneyBee_..._YUV.yuv
-# Override with env vars GBTICL_DATASET_ROOT / GBTICL_OUT_ROOT if your raw YUV
-# files live somewhere else.
+# DATASET_ROOT defaults to the parent of the repository; override it with
+# GBTICL_DATASET_ROOT, and the output root (default data/) with GBTICL_OUT_ROOT.
 SCRIPT_DIR = Path(__file__).resolve().parent
-DATASET_ROOT = Path(os.environ.get("GBTICL_DATASET_ROOT", SCRIPT_DIR.parent))
-OUT_ROOT_PATH = Path(os.environ.get("GBTICL_OUT_ROOT", SCRIPT_DIR))
+DATASET_ROOT = Path(os.environ.get("GBTICL_DATASET_ROOT", ROOT_DIR.parent))
+OUT_ROOT_PATH = Path(os.environ.get("GBTICL_OUT_ROOT", ROOT_DIR / "data"))
 
 SEQUENCES = {
     "Beauty": str(DATASET_ROOT / "Beauty_1920x1080_120fps_420_8bit_YUV_RAW (1)"
@@ -50,13 +55,13 @@ SEQUENCES = {
 
 OUT_ROOT = str(OUT_ROOT_PATH)
 
-# ------------------------------------------------------------------------------
 
+# ------------------------------------------------------------------------------
 FRAME_SIZE = WIDTH * HEIGHT + 2 * (WIDTH // 2) * (HEIGHT // 2)  # I420: Y + U/2 + V/2
 
 
 def read_frame_i420(f, width, height):
-    """Read one I420 (planar 4:2:0) frame and return an HxWx3 uint8 RGB array."""
+    """Read one I420 (planar 4:2:0) frame from an open file and return an HxWx3 uint8 RGB array."""
     y_size = width * height
     c_w, c_h = width // 2, height // 2
     c_size = c_w * c_h
@@ -65,7 +70,7 @@ def read_frame_i420(f, width, height):
     u = np.frombuffer(f.read(c_size), dtype=np.uint8).reshape(c_h, c_w)
     v = np.frombuffer(f.read(c_size), dtype=np.uint8).reshape(c_h, c_w)
 
-    # Upsample chroma to full resolution (nearest-neighbor, matches 4:2:0 co-siting closely enough for still-frame extraction)
+    # Nearest-neighbour chroma upsampling (ignores 4:2:0 chroma siting; adequate for still frames).
     u_full = np.repeat(np.repeat(u, 2, axis=0), 2, axis=1)
     v_full = np.repeat(np.repeat(v, 2, axis=0), 2, axis=1)
 
@@ -73,7 +78,7 @@ def read_frame_i420(f, width, height):
     uf = u_full.astype(np.float32) - 128.0
     vf = v_full.astype(np.float32) - 128.0
 
-    # BT.601 YUV -> RGB (matches typical camera-source test sequences of this era)
+    # BT.601 full-range YCbCr -> RGB.
     r = yf + 1.402 * vf
     g = yf - 0.344136 * uf - 0.714136 * vf
     b = yf + 1.772 * uf
@@ -84,7 +89,7 @@ def read_frame_i420(f, width, height):
 
 
 def sample_indices(total_frames, num_samples):
-    """Uniformly spaced frame indices across the whole clip (covers motion/content variation)."""
+    """Return up to num_samples uniformly spaced frame indices over the whole clip."""
     if num_samples >= total_frames:
         return list(range(total_frames))
     return sorted(set(np.linspace(0, total_frames - 1, num_samples, dtype=int).tolist()))
@@ -95,7 +100,8 @@ def block_partition(img, block_size):
 
     Returns:
         blocks: array of shape (n_blocks_h, n_blocks_w, block_size, block_size, 3)
-        (cropped H, cropped W actually used, in case dims aren't multiples of block_size)
+        h_crop, w_crop: height and width actually used (trailing rows/columns are
+            dropped if the frame is not a multiple of block_size)
     """
     h, w = img.shape[:2]
     h_crop = (h // block_size) * block_size
@@ -110,7 +116,7 @@ def block_partition(img, block_size):
 
 
 def save_block_grid_overlay(img, block_size, out_path):
-    """Draw block boundaries on the frame for visual QA."""
+    """Save a copy of the frame with the block boundaries drawn in red."""
     overlay = img.copy()
     overlay[::block_size, :, :] = [255, 0, 0]
     overlay[:, ::block_size, :] = [255, 0, 0]
@@ -118,6 +124,7 @@ def save_block_grid_overlay(img, block_size, out_path):
 
 
 def main(only_seq=None):
+    """Extract and partition the sampled frames of every sequence (or only `only_seq`)."""
     os.makedirs(OUT_ROOT, exist_ok=True)
 
     seqs = SEQUENCES if only_seq is None else {only_seq: SEQUENCES[only_seq]}
@@ -138,9 +145,8 @@ def main(only_seq=None):
         print(f"[{seq_name}] total_frames={total_frames}, sampling {len(idxs)} frames at indices {idxs[:5]}...{idxs[-3:]}")
 
         with open(path, "rb") as f:
-            last_pos = 0
             for k, idx in enumerate(idxs):
-                # seek forward to the target frame (frames are read sequentially/monotonically since idxs sorted)
+                # Frames are fixed-size, so seek directly to the sampled index.
                 f.seek(idx * FRAME_SIZE)
                 rgb = read_frame_i420(f, WIDTH, HEIGHT)
 
@@ -149,8 +155,7 @@ def main(only_seq=None):
                 blocks_path = os.path.join(blocks_dir, f"{frame_tag}_blocks_{BLOCK_SIZE}x{BLOCK_SIZE}.npy")
                 overlay_path = os.path.join(overlay_dir, f"{frame_tag}_grid.png")
 
-                # resumable: skip work already done (this script is called repeatedly
-                # across short-lived shell invocations, so idempotent skipping matters)
+                # Resumable: skip frames whose outputs already exist.
                 if os.path.exists(png_path) and os.path.exists(blocks_path) and os.path.exists(overlay_path):
                     print(f"  [{seq_name}] {frame_tag} already done, skipping ({k+1}/{len(idxs)})")
                     continue

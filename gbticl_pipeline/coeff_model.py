@@ -1,34 +1,21 @@
 """
-LLM Coefficient Predictor: models p(coefficient) for entropy coding, conditioned
-on the full eigenvalue spectrum Λ from GBT-ICL's eigendecomposition plus the
-already-decoded coefficient history within this block/channel.
+Entropy models for the quantised GFT coefficients.
 
-STATUS: three implementations, in increasing order of capability.
-  - LaplaceCoeffModel: non-learned classical stand-in (see its own docstring).
-    Kept as a baseline -- enough to drive the real range coder end to end and
-    get honest bit costs, and something your trained model needs to beat.
-  - TinyTransformerCoeffModel: the actual trainable "LLM-style" model -- a
-    small causal transformer, built from scratch (no external weights/
-    internet needed), trained via training.py.
-  - HFLoRACoeffModel: an optional wrapper around a real pretrained causal LM
-    (HuggingFace `transformers`) fine-tuned with LoRA (`peft`) -- closer to
-    the original LLaMA-3 + LoRA design. Needs `pip install transformers peft`,
-    a model download, and meaningfully more GPU memory/time than
-    TinyTransformerCoeffModel. Provided as a documented extension path; not
-    exercised in this environment (no internet/GPU here -- see README).
+Every model predicts p(q_k) for the k-th coefficient (ascending graph
+frequency) of one colour channel of one block, conditioned on the full
+eigenvalue spectrum of the block's Laplacian and on the coefficients already
+decoded in the same block/channel. Encoder and decoder recompute the same
+distribution, so nothing besides the range-coded symbols is transmitted.
 
-INTERFACE CHANGE from the earlier placeholder-only version: `symbol_probs`
-now takes the *full* eigenvalue spectrum `eigvals` (shape (n,)) plus the
-integer position `k` being predicted, instead of a single scalar eigenvalue.
-Both encoder and decoder already compute the whole spectrum once per block
-(`eigendecompose` runs before this loop) and it costs nothing extra to pass
-all of it through -- and a real sequence model conditioned on "the shape of
-the whole spectrum so far" is a meaningfully better match for "conditioned on
-Λ" than one conditioned on a single number. codec.py's two call sites were
-updated to match.
+Implementations:
+  - LaplaceCoeffModel: non-learned discrete Laplace prior (baseline).
+  - TinyTransformerCoeffModel: small causal transformer trained from scratch
+    (ablation baseline for the pretrained model).
+  - HFLoRACoeffModel: pretrained causal LM (DistilGPT-2 by default) adapted
+    with LoRA; the model used for the reported GBT-LLM results.
 
-Subclasses nn.Module so `.to(device)`, `state_dict()`/`load_state_dict()`,
-and optimizers all work identically across every implementation here.
+All models subclass nn.Module, so .to(device), state_dict() and optimisers
+behave identically across them.
 """
 
 import math
@@ -39,8 +26,12 @@ import torch.nn.functional as F
 
 
 class CoeffPredictor(nn.Module):
+    """Interface shared by all coefficient entropy models."""
+
     def symbol_probs(self, eigvals, k, history, symbol_range):
         """
+        Distribution of the k-th quantised coefficient given the ones before it.
+
         Args:
             eigvals: (n,) float tensor -- the full graph eigenvalue spectrum Λ
                       for this block (n = block_size**2), identical on both
@@ -62,38 +53,31 @@ class CoeffPredictor(nn.Module):
         raise NotImplementedError
 
     def forward_sequence(self, eigvals, true_values):
-        """Optional: teacher-forced, parallel training pass over one full
-        block/channel. eigvals, true_values: (n,) tensors. Returns logits
-        (n, n_symbols), logits[t] predicts true_values[t]. Only models meant
-        to be trained (TinyTransformerCoeffModel, HFLoRACoeffModel) implement
-        this; LaplaceCoeffModel has no parameters to train."""
+        """
+        Teacher-forced training pass over one block/channel.
+
+        eigvals, true_values: (n,) tensors. Returns logits (n, n_symbols) where
+        logits[t] predicts true_values[t]. Only trainable models implement it.
+        """
         raise NotImplementedError
 
     def precompute_encode_probs(self, eigvals, true_values, symbol_range):
         """
-        ENCODER-ONLY speed optimization: unlike the decoder, the encoder
-        already knows every true quantized coefficient in this block before
-        it entropy-codes any of them. That means it never needs the
-        incremental, one-symbol-at-a-time interface symbol_probs() provides
-        (which exists for the decoder, which genuinely doesn't know future
-        values yet) -- it can get the exact same distributions in one shot,
-        teacher-forced, exactly like training's forward_sequence.
+        Distributions for every coefficient of a block, for use by the encoder.
 
-        Default implementation here just calls symbol_probs 3*n times (same
-        as before, correct for any model including ones with no faster
-        path). TinyTransformerCoeffModel overrides this with a real batched
-        implementation -- see its docstring for the speedup this gives.
+        The encoder knows all quantised coefficients up front, so it does not
+        need the one-symbol-at-a-time interface the decoder uses. The default
+        implementation simply calls symbol_probs 3 * n times; subclasses may
+        override it with a faster batched version.
 
         Args:
             eigvals: (n,) eigenvalue spectrum for this block
-            true_values: (n, 3) tensor -- the TRUE quantized coefficients
+            true_values: (n, 3) quantised coefficients of the block
             symbol_range: (lo, hi)
 
         Returns:
-            probs: (n, 3, n_symbols) float64 tensor. probs[k, ch] is exactly
-                   what symbol_probs(eigvals, k, history_of_true_values_up_to_k[ch],
-                   symbol_range) would have returned -- callers can swap this
-                   in as a drop-in precomputed lookup.
+            (n, 3, n_symbols) float64 tensor; probs[k, ch] equals what
+            symbol_probs would return for coefficient k of channel ch.
         """
         n = true_values.shape[0]
         lo, hi = symbol_range
@@ -108,11 +92,13 @@ class CoeffPredictor(nn.Module):
 
 
 class LaplaceCoeffModel(CoeffPredictor):
-    """Non-learned classical stand-in: a discrete Laplace distribution whose
-    scale shrinks with the eigenvalue (high-frequency coefficients are
-    expected to be small/sparse -- the one genuinely well-justified prior
-    every transform-coding scheme relies on) and widens slightly if recent
-    history had large magnitude. No training, no data -- a baseline."""
+    """
+    Non-learned discrete Laplace prior.
+
+    The scale shrinks with the graph eigenvalue (high-frequency coefficients
+    are expected to be small) and widens slightly when the recent decoded
+    coefficients were large. Used as the no-LLM baseline.
+    """
 
     def __init__(self, base_scale=3.0, min_scale=0.35, history_weight=0.15, floor=1e-6):
         super().__init__()
@@ -159,33 +145,16 @@ class LaplaceCoeffModel(CoeffPredictor):
 
 class TinyTransformerCoeffModel(CoeffPredictor):
     """
-    The real, trainable "LLM-style" coefficient predictor: a small causal
-    (GPT-style) transformer, built from scratch, no external weights or
-    internet access needed to train or run it.
+    Small causal transformer trained from scratch on the coefficient task.
 
-    Architecture, standard autoregressive-LM shape: at position t, the input
-    token is built from (a) an embedding of the coefficient value emitted at
-    position t-1 (or a learned BOS embedding at t=0 -- exactly how a causal
-    LM's input at step t is the token generated at step t-1), plus (b) an
-    embedding of eigvals[t] (this position's graph eigenvalue -- the Λ
-    conditioning), plus (c) a learned positional embedding. Causal
-    self-attention lets position t see everything decoded before it, not
-    just the immediately preceding value, via the usual attention
-    aggregation through earlier layers.
+    The input token at position t is the sum of an embedding of the previous
+    coefficient (a learned BOS embedding at t = 0), an embedding of the graph
+    eigenvalue at t, and a learned positional embedding. Causal self-attention
+    lets position t see every earlier coefficient in the block.
 
-    Two entry points:
-      - forward_sequence: teacher-forced, whole block/channel in one forward
-        pass -- what training.py uses (parallel, like training any causal LM).
-      - symbol_probs: incremental, one coefficient at a time -- what the
-        actual encoder/decoder loop uses, since a real decoder only has the
-        history it's decoded so far, exactly like next-token generation.
-
-    PERFORMANCE NOTE: symbol_probs recomputes attention over the whole
-    prefix from scratch every call (no KV-cache) -- fine for correctness and
-    for dissertation-scale evaluation, but the first thing to optimise if
-    this needs to run over full-resolution video: cache the encoder's
-    key/value projections across the 64 calls within a block instead of
-    rebuilding them every time.
+    forward_sequence is the teacher-forced pass used for training;
+    symbol_probs is the incremental pass used by the decoder. The latter
+    caches per-layer keys/values across the calls for one block/channel.
     """
 
     def __init__(self, block_size=8, symbol_range=(-2200, 2200), d_model=64,
@@ -194,6 +163,7 @@ class TinyTransformerCoeffModel(CoeffPredictor):
         self.block_size = block_size
         self.n = block_size * block_size
         self.symbol_range = tuple(symbol_range)
+        self.n_heads = n_heads
         n_symbols = symbol_range[1] - symbol_range[0] + 1
 
         self.value_embed = nn.Sequential(
@@ -205,23 +175,12 @@ class TinyTransformerCoeffModel(CoeffPredictor):
         self.pos_embed = nn.Embedding(self.n, d_model)
         self.bos = nn.Parameter(torch.zeros(d_model))  # learned "no history yet" embedding
 
-        # Optional cross-frame conditioning (encode_video/decode_video, codec.py):
-        # at position k, the previous frame's co-located block's DECODED
-        # quantized coefficient at the same frequency index k, embedded the
-        # same way as this frame's own history values and summed in. Off by
-        # default (temporal_values=None everywhere below falls back to the
-        # learned `no_temporal` embedding), so the plain per-image path
-        # (encode_image/decode_image, no video/temporal context) is
-        # completely unaffected -- this only activates when the caller
-        # actually has cross-frame data to offer.
-        #
-        # KNOWN LIMITATION (documented, not hidden): GBTICLMetaLearner's
-        # predicted eigenbasis can shift block-to-block, so "frequency index
-        # k" is only an approximate cross-frame correspondence, not the same
-        # physical basis vector every frame. See run_dataset_pipeline.py's
-        # ablation matrix for an explicit on/off comparison of whether this
-        # conditioning actually helps given that misalignment risk, rather
-        # than assuming it does.
+        # Optional cross-frame conditioning (video mode): the previous frame's
+        # co-located block contributes its decoded coefficient at the same
+        # frequency index. Without it, a learned `no_temporal` embedding is used,
+        # so the single-image path is unaffected. The index only approximately
+        # matches across frames because the predicted eigenbasis can change from
+        # block to block; the ablations measure whether the conditioning helps.
         self.temporal_value_embed = nn.Sequential(
             nn.Linear(2, d_model), nn.GELU(), nn.Linear(d_model, d_model)
         )
@@ -232,36 +191,51 @@ class TinyTransformerCoeffModel(CoeffPredictor):
             dropout=0.0, batch_first=True, activation="gelu",
         )
         self.encoder = nn.TransformerEncoder(layer, n_layers)
+        assert not self.encoder.layers[0].norm_first, (
+            "cached inference path (_layer_step) assumes post-norm "
+            "(norm_first=False, the default) -- update it if this ever changes"
+        )
         self.out_proj = nn.Linear(d_model, n_symbols)
         self.d_model = d_model
 
+        self._kv_caches = {}
+
+    _MAX_CACHE_SLOTS = 8
+
+    def _evict_cache_if_full(self):
+        # Drop the oldest entry; a miss later is recomputed, so this only costs speed.
+        if len(self._kv_caches) > self._MAX_CACHE_SLOTS:
+            oldest_key = next(iter(self._kv_caches))
+            del self._kv_caches[oldest_key]
+
     def _value_feat(self, values):
-        """Continuous value embedding input: raw scale + sign-log magnitude,
-        so both small and large coefficients (this project uses a wide
-        symbol_range like (-2200,2200) to cover near-lossless DC terms) are
-        representable without a huge lookup table."""
+        """Embedding input for a coefficient: linear scale and signed log magnitude.
+
+        Keeps both small and very large values (the symbol range is wide enough
+        for near-lossless DC terms) representable without a huge lookup table.
+        """
         scaled = values / 256.0
         logmag = torch.sign(values) * torch.log1p(torch.abs(values)) / 8.0
         return torch.stack([scaled, logmag], dim=-1)
 
-    def _tokens(self, eigvals, prev_values, device, temporal_values=None):
-        """Batched token builder -- the single implementation both
-        forward_sequence (training, real batch size) and symbol_probs
-        (inference, batch size 1) go through, so the two can never drift
-        into architecturally different code paths.
+    def _tokens(self, eigvals, prev_values, device, temporal_values=None, pos_start=0):
+        """Build input tokens for positions pos_start .. pos_start + n_pos - 1.
+
+        Shared by forward_sequence (training) and symbol_probs (decoding) so both
+        use the same architecture.
 
         eigvals, prev_values: (B, n_pos) -> tokens: (B, n_pos, d_model)
-        temporal_values: optional (B, n_pos) -- previous frame's co-located
-            block's decoded coefficient at each position (see class
-            docstring); None means no cross-frame conditioning available,
-            uses the learned no_temporal fallback for every position.
+        temporal_values: optional (B, n_pos), previous-frame coefficients; when
+            None the learned no_temporal embedding is used at every position.
         """
         b, n_pos = eigvals.shape
         val_emb = self.value_embed(self._value_feat(prev_values))  # (B,n_pos,d)
         val_emb = val_emb.clone()
-        val_emb[:, 0] = self.bos  # position 0 has no predecessor coefficient
+        if pos_start == 0:
+            val_emb[:, 0] = self.bos  # position 0 has no predecessor coefficient
         eig_emb = self.eigval_embed(eigvals.to(torch.float32).unsqueeze(-1))  # (B,n_pos,d)
-        pos = self.pos_embed(torch.arange(n_pos, device=device)).unsqueeze(0).expand(b, -1, -1)
+        positions = torch.arange(pos_start, pos_start + n_pos, device=device)
+        pos = self.pos_embed(positions).unsqueeze(0).expand(b, -1, -1)
 
         if temporal_values is not None:
             temp_emb = self.temporal_value_embed(self._value_feat(temporal_values))  # (B,n_pos,d)
@@ -271,13 +245,7 @@ class TinyTransformerCoeffModel(CoeffPredictor):
         return val_emb + eig_emb + pos + temp_emb
 
     def forward_sequence(self, eigvals, true_values, temporal_values=None):
-        """Teacher-forced training pass.
-        eigvals, true_values: (n,) for one sequence or (B, n) for a batch.
-        temporal_values: optional, same shape as true_values -- see
-            _tokens()'s docstring and the class docstring's cross-frame
-            conditioning note.
-        Returns logits: (n, n_symbols) or (B, n, n_symbols) matching input rank.
-        """
+        """Teacher-forced pass: (n,) or (B, n) inputs -> logits (n, n_symbols) or (B, n, n_symbols)."""
         squeeze = eigvals.dim() == 1
         if squeeze:
             eigvals, true_values = eigvals.unsqueeze(0), true_values.unsqueeze(0)
@@ -293,20 +261,67 @@ class TinyTransformerCoeffModel(CoeffPredictor):
         logits = self.out_proj(out)  # (B,n,n_symbols)
         return logits.squeeze(0) if squeeze else logits
 
+    def _self_attn_step(self, layer, x_new, k_cache, v_cache):
+        """Self-attention for one new position, appending its key/value to the cache."""
+        attn = layer.self_attn
+        d_model = x_new.shape[-1]
+        num_heads = attn.num_heads
+        head_dim = d_model // num_heads
+
+        qkv = F.linear(x_new, attn.in_proj_weight, attn.in_proj_bias)
+        q, k_new, v_new = qkv.chunk(3, dim=-1)
+
+        k_all = k_new if k_cache is None else torch.cat([k_cache, k_new], dim=1)
+        v_all = v_new if v_cache is None else torch.cat([v_cache, v_new], dim=1)
+        t = k_all.shape[1]
+
+        q_h = q.view(1, 1, num_heads, head_dim).transpose(1, 2)
+        k_h = k_all.view(1, t, num_heads, head_dim).transpose(1, 2)
+        v_h = v_all.view(1, t, num_heads, head_dim).transpose(1, 2)
+
+        scores = torch.matmul(q_h, k_h.transpose(-1, -2)) / math.sqrt(head_dim)
+        weights = F.softmax(scores, dim=-1)
+        out_h = torch.matmul(weights, v_h)
+        out = out_h.transpose(1, 2).reshape(1, 1, d_model)
+        out = attn.out_proj(out)
+        return out, k_all, v_all
+
+    def _layer_step(self, layer, x_new, cache_entry):
+        """One post-norm nn.TransformerEncoderLayer step (attention + feed-forward) for one position."""
+        k_cache, v_cache = cache_entry if cache_entry is not None else (None, None)
+        attn_out, k_all, v_all = self._self_attn_step(layer, x_new, k_cache, v_cache)
+        x = layer.norm1(x_new + attn_out)
+        ff = layer.linear2(layer.dropout(layer.activation(layer.linear1(x))))
+        x = layer.norm2(x + ff)
+        return x, (k_all, v_all)
+
+    def _forward_incremental(self, eigvals, k, prev_val, device, temporal_val=None, layer_caches=None):
+        """Run position k through every encoder layer, reusing and extending the per-layer caches."""
+        eig_k = eigvals[k:k + 1].unsqueeze(0)
+        prev = prev_val.to(device=device, dtype=torch.float32).view(1, 1)
+        temp = None
+        if temporal_val is not None:
+            temp = temporal_val.to(device=device, dtype=torch.float32).view(1, 1)
+        x = self._tokens(eig_k, prev, device, temporal_values=temp, pos_start=k)
+
+        new_caches = []
+        for layer, cache_entry in zip(self.encoder.layers, layer_caches):
+            x, new_entry = self._layer_step(layer, x, cache_entry)
+            new_caches.append(new_entry)
+
+        logits = self.out_proj(x[0, -1]).to(torch.float64)
+        return logits, new_caches
+
     def symbol_probs(self, eigvals, k, history, symbol_range, temporal_values=None):
         """
-        Decoder-side, incremental (one symbol at a time -- the decoder
-        genuinely doesn't know later values yet). NO KV-cache: this rebuilds
-        and reattends over the whole 0..k prefix from scratch every call,
-        which is correct but means total work across a block/channel is
-        O(n^3) instead of O(n^2) -- the known, currently-unoptimised cost
-        (see the class docstring's PERFORMANCE NOTE). For the encoder side,
-        use precompute_encode_probs instead (below) -- it needs none of this
-        because the encoder already has every true value up front.
+        Incremental distribution for coefficient k, used by the decoder.
 
-        temporal_values: optional (n,) tensor -- the previous frame's
-            co-located block's decoded coefficients at positions 0..n-1 (only
-            0..k actually used here); None means no cross-frame conditioning.
+        Per-layer key/value caches are keyed by id(history); a cache is reused
+        only when it was built for exactly k earlier positions, otherwise the
+        prefix is recomputed.
+
+        temporal_values: optional (n,) previous-frame coefficients for this
+        block/channel (only index k is used per call).
         """
         assert tuple(symbol_range) == self.symbol_range, (
             f"TinyTransformerCoeffModel was built for symbol_range={self.symbol_range}, "
@@ -314,35 +329,40 @@ class TinyTransformerCoeffModel(CoeffPredictor):
         )
         device = next(self.parameters()).device
         eigvals = eigvals.to(device=device, dtype=torch.float32)
-        n_pos = k + 1
-        prev = torch.zeros(n_pos, device=device, dtype=torch.float32)
-        if history:
-            prev[1:] = torch.tensor(history, device=device, dtype=torch.float32)
-        temp = None
-        if temporal_values is not None:
-            temp = temporal_values[:n_pos].to(device=device, dtype=torch.float32).unsqueeze(0)
-        tokens = self._tokens(eigvals[:n_pos].unsqueeze(0), prev.unsqueeze(0), device,
-                               temporal_values=temp)  # (1,n_pos,d)
-        mask = nn.Transformer.generate_square_subsequent_mask(n_pos).to(device)
-        out = self.encoder(tokens, mask=mask)
-        logits = self.out_proj(out[0, -1]).to(torch.float64)  # (n_symbols,)
+        cache_key = id(history)
+        prev_val = torch.tensor(0.0 if k == 0 else float(history[-1]))
+        temp_val = None if temporal_values is None else temporal_values[k]
+
+        cached = self._kv_caches.get(cache_key)
+        if k == 0:
+            layer_caches = [None] * len(self.encoder.layers)
+        elif cached is not None and cached[1] == k and len(history) == k:
+            layer_caches = cached[0]
+        else:
+            layer_caches = [None] * len(self.encoder.layers)
+            for j in range(k):
+                prev_j = torch.tensor(0.0 if j == 0 else float(history[j - 1]))
+                temp_j = None if temporal_values is None else temporal_values[j]
+                _, layer_caches = self._forward_incremental(
+                    eigvals, j, prev_j, device, temporal_val=temp_j, layer_caches=layer_caches)
+
+        logits, new_layer_caches = self._forward_incremental(
+            eigvals, k, prev_val, device, temporal_val=temp_val, layer_caches=layer_caches)
+        self._kv_caches[cache_key] = (new_layer_caches, k + 1)
+        self._evict_cache_if_full()
+
         probs = F.softmax(logits, dim=-1)
         probs = probs + 1e-6
         return probs / probs.sum()
 
     def precompute_encode_probs(self, eigvals, true_values, symbol_range, temporal_values=None):
         """
-        Encoder-side fast path: ONE batched forward pass (batch=3, one per
-        colour channel) covering all 64 positions at once, teacher-forced
-        with the true values -- instead of 192 separate incremental calls
-        each redoing attention over a growing prefix. This is architecturally
-        identical to symbol_probs (same _tokens()/encoder pipeline), just
-        computed in parallel because the encoder is allowed to (it already
-        has every true coefficient before it entropy-codes any of them).
+        Encoder-side distributions for a whole block.
 
-        temporal_values: optional (n, 3) tensor -- previous frame's
-            co-located block's decoded coefficients, same layout as
-            true_values; None means no cross-frame conditioning.
+        Calls symbol_probs in decoder order so that the encoder and decoder see
+        bit-identical probabilities.
+
+        temporal_values: optional (n, 3) previous-frame coefficients.
         """
         assert tuple(symbol_range) == self.symbol_range, (
             f"TinyTransformerCoeffModel was built for symbol_range={self.symbol_range}, "
@@ -350,83 +370,40 @@ class TinyTransformerCoeffModel(CoeffPredictor):
         )
         device = next(self.parameters()).device
         eigvals = eigvals.to(device=device, dtype=torch.float32)
-        true_vals_rep = true_values.to(device=device, dtype=torch.float32).transpose(0, 1)  # (3, n)
-        eigvals_rep = eigvals.unsqueeze(0).expand(3, -1)  # (3, n)
-        temporal_rep = None
-        if temporal_values is not None:
-            temporal_rep = temporal_values.to(device=device, dtype=torch.float32).transpose(0, 1)  # (3, n)
-
-        logits = self.forward_sequence(eigvals_rep, true_vals_rep, temporal_values=temporal_rep)  # (3, n, n_symbols)
-        probs = F.softmax(logits.to(torch.float64), dim=-1) + 1e-6
-        probs = probs / probs.sum(dim=-1, keepdim=True)
-        return probs.permute(1, 0, 2).contiguous()  # (n, 3, n_symbols)
+        n = eigvals.shape[0]
+        lo, hi = symbol_range
+        n_symbols = hi - lo + 1
+        out = torch.zeros(n, 3, n_symbols, dtype=torch.float64, device=device)
+        for ch in range(3):
+            history = []
+            temp_ch = temporal_values[:, ch] if temporal_values is not None else None
+            kwargs = {"temporal_values": temp_ch} if temp_ch is not None else {}
+            for k in range(n):
+                out[k, ch] = self.symbol_probs(eigvals, k, history, symbol_range, **kwargs)
+                history.append(int(true_values[k, ch].item()))
+        return out
 
 
 class HFLoRACoeffModel(CoeffPredictor):
     """
-    The real pretrained-LLM coefficient predictor: wraps a real pretrained
-    causal LM (HuggingFace `transformers`), fine-tuned with LoRA adapters
-    (`peft`) -- this is what satisfies "repurpose a real pretrained LLM" for
-    coefficient prediction (as opposed to TinyTransformerCoeffModel, a small
-    transformer trained from scratch only on this task; that class stays as
-    an explicit ablation baseline for exactly this comparison).
+    Pretrained causal language model adapted with LoRA as a coefficient predictor.
 
-    Default base model: distilgpt2 (82M params, 6 layers, hidden=768).
-    Chosen because (a) it's unambiguously "a real pretrained LLM" while
-    leaving large VRAM headroom on an 8GB card, (b) OpenAI's GPT-2 license
-    permits this use, (c) `target_modules=["c_attn"]` below matches its
-    architecture directly. `HuggingFaceTB/SmolLM2-135M` (Apache-2.0,
-    `target_modules=["q_proj","v_proj"]`, already the fallback branch below)
-    is a documented drop-in alternative for a more modern base model.
+    Coefficients are not tokenised as text. Each position's embedding (previous
+    coefficient + graph eigenvalue + position [+ previous-frame coefficient])
+    is fed to the language model through `inputs_embeds`, and the final hidden
+    state is mapped to logits over the symbol range by a small trained head.
+    Only the LoRA adapters and these input/output modules are trained; the
+    pretrained weights stay frozen.
 
-    Rather than tokenising coefficients as text, this feeds `inputs_embeds`
-    directly (a standard technique): each position's embedding is built the
-    same way as TinyTransformerCoeffModel's (value + eigval + position +
-    optional cross-frame temporal value, see coeff_model.py's module-level
-    note on that), projected up to the LM's hidden size, run through the
-    frozen (LoRA-adapted) LM, and the final hidden state is projected back
-    down to logits over symbol_range by a small trained head. The LM's own
-    token-embedding matrix and vocabulary are not used at all -- only its
-    pretrained transformer *body* and attention patterns are reused and
-    lightly adapted.
+    Default base model: distilgpt2 (82M parameters, 6 layers, hidden size 768).
+    Other GPT-2 style models work directly; models using q_proj/v_proj
+    attention (for example SmolLM2-135M) use those as LoRA target modules.
 
-    VRAM-fitting design (see class docstring continuation in __init__):
-    frozen base loaded in bfloat16, gradient checkpointing enabled, only
-    LoRA adapters + the small head modules (kept in fp32 for stable
-    optimization) are trainable.
-
-    KV-CACHING (symbol_probs): unlike TinyTransformerCoeffModel's
-    from-scratch encoder (no native cache support, O(n^3) decode cost -- see
-    its class docstring), this class uses the underlying HF model's native
-    `past_key_values`/`use_cache=True` support to make incremental decoding
-    O(n^2) like normal autoregressive generation.
-
-    MULTI-SLOT, not single-slot (bug found and fixed during testing): both
-    decode_image and decode_video call symbol_probs in INTERLEAVED order --
-    for k in range(n): for ch in range(3): symbol_probs(...) -- i.e. three
-    independent per-channel sequences advance one step at a time, round-
-    robin, not one whole channel at a time. A single shared cache slot on
-    the model instance is wrong here: it would attend with position-k's
-    attention_mask length but only the *previous channel's* cached K/V,
-    silently corrupting every channel-switch (confirmed: with a single-slot
-    cache, this desynced ~98% of symbols within one block on real image
-    data). Fixed with a small dict of caches keyed by `id(history)`:
-    codec.py's decode loops build one persistent Python list per (block,
-    channel) -- `history[ch]`, mutated via .append() across the k=0..n-1
-    calls for that channel -- so the *same list object* recurs on every
-    call within one channel's decode, letting each channel's cache be kept
-    independently without changing codec.py's calling convention or the
-    shared CoeffPredictor interface.
-
-    Robustness against Python `id()` reuse (a freed list's memory address
-    being reassigned to an unrelated new list): every cache entry also
-    records the expected history length: a `len(history) != expected`
-    mismatch is treated as a cache miss and triggers a safe "cold start"
-    recompute of the full 0..k prefix in one call (correct, just slower --
-    this is a defensive fallback for a scenario that shouldn't occur under
-    normal codec usage, not the expected hot path). The cache dict is also
-    capped in size (oldest entries evicted) so very long runs (thousands of
-    blocks) don't grow it unbounded.
+    Decoding uses the model's native key/value cache. The decoder interleaves
+    the three colour channels (k outer loop, channel inner loop), so one cache is
+    kept per channel, keyed by id(history). An entry is reused only if it was
+    built for exactly k earlier positions; otherwise the prefix is recomputed
+    ("cold start"). The number of cached entries is capped.
     """
     _MAX_CACHE_SLOTS = 8
 
@@ -434,46 +411,41 @@ class HFLoRACoeffModel(CoeffPredictor):
                  lora_dropout=0.05, block_size=8, symbol_range=(-2200, 2200),
                  lm_dtype=None):
         super().__init__()
+        # transformers/peft are imported lazily so the other models work without them
         try:
             from transformers import AutoModel
             from peft import LoraConfig, get_peft_model
         except ImportError as e:
             raise ImportError(
-                "HFLoRACoeffModel needs `pip install transformers peft` "
-                "(and, at import time, internet access to download "
-                f"'{base_model_name}'). Not available in this environment -- "
-                "use TinyTransformerCoeffModel instead, or install these "
-                "packages and an internet-enabled/GPU machine to use this class."
+                "HFLoRACoeffModel requires the `transformers` and `peft` packages "
+                f"(and access to the '{base_model_name}' weights); "
+                "install them with `pip install transformers peft`."
             ) from e
 
         self.symbol_range = tuple(symbol_range)
         n_symbols = symbol_range[1] - symbol_range[0] + 1
         self.n = block_size * block_size
-        # bfloat16 for the frozen base: well-supported and numerically stable
-        # on Ada/Blackwell-class Tensor Cores (this project's target GPU),
-        # no loss-scaler needed unlike fp16. CPU-only fallback uses fp32
-        # (bf16 matmuls are slow/unsupported on many CPUs).
+
+        # bfloat16 for the frozen base on GPU (no loss scaling needed, unlike fp16);
+        # fp32 on CPU, where bf16 matmuls are slow or unsupported.
         self.lm_dtype = lm_dtype or (torch.bfloat16 if torch.cuda.is_available() else torch.float32)
 
+        # Attach LoRA adapters to the attention projections; base weights stay frozen
         base = AutoModel.from_pretrained(base_model_name, dtype=self.lm_dtype)
         lora_cfg = LoraConfig(
             r=lora_r, lora_alpha=lora_alpha,
             target_modules=["c_attn"] if base_model_name.startswith(("gpt2", "distilgpt2")) else ["q_proj", "v_proj"],
             lora_dropout=lora_dropout, bias="none",
         )
-        # required for LoRA to receive gradients when the model's INPUT is
-        # inputs_embeds (not token ids through the frozen embedding table,
-        # which is what enable_input_require_grads() normally hooks) --
-        # gradient checkpointing needs this too, or backprop silently stops
-        # at the first checkpointed layer
+
+        # Gradient checkpointing with inputs_embeds needs enable_input_require_grads(),
+        # otherwise no gradient reaches the LoRA layers.
         base.gradient_checkpointing_enable()
         base.enable_input_require_grads()
         self.lm = get_peft_model(base, lora_cfg)  # base weights frozen; only LoRA adapters train
         d_model = base.config.hidden_size
 
-        # heads kept in fp32 (not lm_dtype) for stable optimization -- cheap:
-        # out_proj is the largest of these at d_model*n_symbols params, still
-        # a few MB even at fp32 with Adam's two fp32 moment buffers
+        # Input embeddings and output head are kept in fp32 for stable optimisation
         self.value_embed = nn.Sequential(nn.Linear(2, d_model), nn.GELU(), nn.Linear(d_model, d_model))
         self.eigval_embed = nn.Sequential(nn.Linear(1, d_model), nn.GELU(), nn.Linear(d_model, d_model))
         self.pos_embed = nn.Embedding(self.n, d_model)
@@ -482,8 +454,7 @@ class HFLoRACoeffModel(CoeffPredictor):
         self.no_temporal = nn.Parameter(torch.zeros(d_model))
         self.out_proj = nn.Linear(d_model, n_symbols)
 
-        # {id(history): (past_key_values, expected_len)} -- see class
-        # docstring's KV-CACHING section for why this must be multi-slot
+        # {id(history): (past_key_values, number of cached positions)}
         self._kv_caches = {}
 
     def _value_feat(self, values):
@@ -492,13 +463,9 @@ class HFLoRACoeffModel(CoeffPredictor):
         return torch.stack([scaled, logmag], dim=-1)
 
     def _embed_positions(self, eigvals, prev_values, pos_start, device, temporal_values=None):
-        """Build embeddings for a contiguous range of positions
-        [pos_start, pos_start+len(eigvals)) -- used both for a full-sequence
-        forward pass (pos_start=0) and for a single new position during
-        incremental KV-cached decoding (pos_start=k, len==1).
+        """Embeddings for positions pos_start .. pos_start + len(eigvals) - 1.
 
-        eigvals, prev_values: (n_pos,). temporal_values: optional (n_pos,).
-        Returns: (1, n_pos, d_model) in fp32 (caller casts to lm_dtype).
+        eigvals, prev_values, temporal_values: (n_pos,) -> (1, n_pos, d_model), fp32.
         """
         n_pos = eigvals.shape[0]
         val_emb = self.value_embed(self._value_feat(prev_values))
@@ -515,14 +482,7 @@ class HFLoRACoeffModel(CoeffPredictor):
         return (val_emb + eig_emb + pos + temp_emb).unsqueeze(0)  # (1, n_pos, d)
 
     def _embed_positions_batched(self, eigvals, prev_values, device, temporal_values=None):
-        """Real-batch counterpart of _embed_positions, always pos_start=0
-        (full-sequence only): eigvals, prev_values: (B, n_pos) ->
-        (B, n_pos, d_model). Used by forward_sequence's actual training path
-        (training.py's train_step_metalearner passes a real (B*3, n) batch,
-        not a single sequence) -- kept as a separate method rather than
-        overloading _embed_positions with an extra dim-handling branch,
-        since the incremental decode paths (symbol_probs, _cold_start) are
-        deliberately single-sequence and simpler for it."""
+        """Batched _embed_positions for full sequences: (B, n_pos) -> (B, n_pos, d_model)."""
         b, n_pos = eigvals.shape
         val_emb = self.value_embed(self._value_feat(prev_values))  # (B,n_pos,d)
         val_emb = val_emb.clone()
@@ -536,18 +496,14 @@ class HFLoRACoeffModel(CoeffPredictor):
         return val_emb + eig_emb + pos + temp_emb  # (B, n_pos, d)
 
     def _run_full(self, inputs_embeds):
-        """Full-sequence forward pass, no cache -- used by forward_sequence
-        (training / encoder-side precompute_encode_probs, teacher-forced,
-        parallel over the whole block/channel in one call). Batch-size
-        agnostic: works for (1, n, d) or real (B, n, d) alike."""
+        """Full-sequence forward pass without cache; returns hidden states (B, n_pos, d) in fp32."""
         attn = torch.ones(inputs_embeds.shape[:2], dtype=torch.long, device=inputs_embeds.device)
         out = self.lm(inputs_embeds=inputs_embeds.to(self.lm_dtype), attention_mask=attn)
         return out.last_hidden_state.to(torch.float32)  # (B, n_pos, d)
 
     def forward_sequence(self, eigvals, true_values, temporal_values=None):
-        """eigvals, true_values: (n,) for one sequence, or (B, n) for a real
-        batch (training.py's train_step_metalearner always uses the latter).
-        Returns logits: (n, n_symbols) or (B, n, n_symbols) matching input rank."""
+        """Teacher-forced pass: (n,) or (B, n) inputs -> logits (n, n_symbols) or (B, n, n_symbols)."""
+        # Input at position t is the coefficient at t - 1
         squeeze = eigvals.dim() == 1
         if squeeze:
             eigvals, true_values = eigvals.unsqueeze(0), true_values.unsqueeze(0)
@@ -558,24 +514,19 @@ class HFLoRACoeffModel(CoeffPredictor):
         prev = torch.zeros(b, n, device=device, dtype=torch.float32)
         prev[:, 1:] = true_values[:, :-1].to(torch.float32)
         embeds = self._embed_positions_batched(eigvals, prev, device, temporal_values=temporal_values)
+        # Run the LLM and project hidden states to coefficient logits
         hidden = self._run_full(embeds)  # (B, n, d)
-        logits = self.out_proj(hidden)   # (B, n, n_symbols)
+        logits = self.out_proj(hidden)  # (B, n, n_symbols)
         return logits.squeeze(0) if squeeze else logits
 
     def _evict_cache_if_full(self):
         if len(self._kv_caches) > self._MAX_CACHE_SLOTS:
-            # crude but safe: drop the oldest entry (dict preserves insertion
-            # order in Python 3.7+); anything evicted just becomes a cache
-            # miss later, handled correctly (if slower) by the cold-start
-            # fallback below -- never a correctness issue, only a speed one
+            # Drop the oldest entry; a later miss falls back to _cold_start
             oldest_key = next(iter(self._kv_caches))
             del self._kv_caches[oldest_key]
 
     def _cold_start(self, eigvals, history, k, device, temporal_values=None):
-        """Rebuild the full 0..k prefix in one forward pass (no cache reuse)
-        -- the safe fallback for a genuine cache miss (first call for this
-        history, or a length-mismatch indicating a stale/evicted/colliding
-        slot -- see class docstring). Returns (hidden_state_at_k, past_key_values)."""
+        """Recompute positions 0..k in one pass (cache miss); returns (hidden state at k, past_key_values)."""
         n_pos = k + 1
         prev = torch.zeros(n_pos, device=device, dtype=torch.float32)
         if history:
@@ -589,17 +540,18 @@ class HFLoRACoeffModel(CoeffPredictor):
         return out.last_hidden_state[0, -1].to(torch.float32), out.past_key_values
 
     def symbol_probs(self, eigvals, k, history, symbol_range, temporal_values=None):
-        """Decoder-side, incremental, KV-cached (see class docstring's
-        MULTI-SLOT section: caches are keyed by id(history) since decode
-        interleaves 3 channels' sequences round-robin, not one at a time).
-        temporal_values, if given, is the full (n,) previous-frame-
-        coefficient array for this block/channel -- only temporal_values[k]
-        is used per call."""
+        """
+        Incremental, KV-cached distribution for coefficient k (decoder side).
+
+        temporal_values: optional (n,) previous-frame coefficients for this
+        block/channel; only index k is used per call.
+        """
         assert tuple(symbol_range) == self.symbol_range
         device = next(self.parameters()).device
         eigvals = eigvals.to(device=device, dtype=torch.float32)
         cache_key = id(history)
 
+        # Update this channel's attention cache
         if k == 0:
             self._kv_caches.pop(cache_key, None)  # fresh sequence, discard any stale/colliding entry
             temp_val = temporal_values[0:1].to(device=device, dtype=torch.float32) if temporal_values is not None else None
@@ -613,7 +565,7 @@ class HFLoRACoeffModel(CoeffPredictor):
         else:
             cached = self._kv_caches.get(cache_key)
             if cached is not None and cached[1] == k and len(history) == k:
-                # hot path: reuse cache, feed only the single new token
+                # cache hit: feed only the new position
                 past, _ = cached
                 prev_val = torch.tensor([float(history[-1])], device=device, dtype=torch.float32)
                 temp_val = temporal_values[k:k + 1].to(device=device, dtype=torch.float32) if temporal_values is not None else None
@@ -624,40 +576,28 @@ class HFLoRACoeffModel(CoeffPredictor):
                 hidden = out.last_hidden_state[0, -1].to(torch.float32)
                 self._kv_caches[cache_key] = (out.past_key_values, k + 1)
             else:
-                # cold path: cache miss (first call at k>0 for this key, or a
-                # length mismatch -- see class docstring's id()-reuse note)
+                # cache miss: first call for this history, or a stale/evicted slot
                 hidden, past = self._cold_start(eigvals, history, k, device, temporal_values=temporal_values)
                 self._kv_caches[cache_key] = (past, k + 1)
                 self._evict_cache_if_full()
 
+        # Small floor keeps every symbol encodable
         logits = self.out_proj(hidden).to(torch.float64)
         probs = F.softmax(logits, dim=-1) + 1e-6
         return probs / probs.sum()
 
     def precompute_encode_probs(self, eigvals, true_values, symbol_range, temporal_values=None):
         """
-        ENCODER-ONLY, but deliberately NOT a parallel/batched shortcut
-        (unlike TinyTransformerCoeffModel's, or an earlier version of this
-        method): loops through symbol_probs exactly like decode_image/
-        decode_video will, one symbol at a time per channel, reusing its
-        KV-cache. This guarantees BIT-IDENTICAL probabilities to the
-        decoder, which turned out to matter here specifically: a real
-        pretrained LM run in bfloat16 does NOT give bit-identical results
-        between "one parallel forward pass over the whole teacher-forced
-        sequence" and "many incremental KV-cached forward calls, one new
-        position at a time" -- confirmed by direct testing, differences of
-        ~0.005-0.02 in the resulting probabilities, easily enough to shift
-        the integer frequency table (range_coder.py's TOTAL_FREQ=16384
-        precision) and silently desync the decoder starting from the very
-        first symbol (observed: PSNR collapsing to ~5dB on real image data).
-        TinyTransformerCoeffModel does NOT have this problem (verified
-        directly, exact match at real coefficient scale) because it runs in
-        plain fp32 and recomputes attention from scratch on every call
-        either way -- there is no separate "batched" vs "cached" code path
-        for its numerics to diverge between. This method is still
-        meaningfully faster than "no cache at all" thanks to symbol_probs'
-        own id(history)-keyed KV-caching, just not as fast as a true single
-        parallel forward pass would be if it were numerically safe here.
+        Encoder-side distributions for a whole block.
+
+        Deliberately not a single teacher-forced pass: it calls symbol_probs in
+        decoder order. A bfloat16 language model gives slightly different
+        probabilities for one parallel pass and for incremental cached passes;
+        after integer quantisation of the frequency table those differences
+        desynchronise the range decoder. Using the same code path on both
+        sides guarantees identical probabilities.
+
+        temporal_values: optional (n, 3) previous-frame coefficients.
         """
         assert tuple(symbol_range) == self.symbol_range
         device = next(self.parameters()).device

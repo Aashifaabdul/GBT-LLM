@@ -1,12 +1,9 @@
-"""End-to-end encode_image/decode_image round-trip on synthetic data, for
-every GBT-ICL/coefficient-model combination the project ships, at multiple
-quant_steps. This is the promoted, repeatable version of the manual smoke
-test run against test_codec.py -- it must stay green before any downstream
-stage (temporal extension, real training, ablations) is trusted."""
+"""codec.py: encode_image/decode_image round-trip on synthetic images for
+every graph-model / coefficient-model combination, at several quantisation
+steps. The decoder must reproduce a finite image of the original shape."""
 
 import numpy as np
 import pytest
-import torch
 
 from gbticl_pipeline.codec import encode_image, decode_image
 from gbticl_pipeline.evaluate import psnr, bits_per_pixel
@@ -18,8 +15,9 @@ WIDE_RANGE = (-2200, 2200)
 
 def _synthetic_image(h=16, w=16, seed=0):
     rng = np.random.default_rng(seed)
-    # smooth gradient + noise, more representative of real image content than
-    # pure uniform random noise (which stresses the entropy coder unrealistically)
+
+    # smooth gradient plus mild noise; closer to natural image content than
+    # uniform random noise
     yy, xx = np.mgrid[0:h, 0:w]
     base = (128 + 60 * np.sin(xx / 4.0) + 40 * np.cos(yy / 5.0))
     img = np.stack([base] * 3, axis=-1) + rng.normal(0, 5, size=(h, w, 3))
@@ -48,17 +46,16 @@ def test_codec_roundtrip_finite_and_lossless_structure(device, gbticl_cls, coeff
 
     p = psnr(img, recon)
     assert np.isfinite(p) or p == float("inf")
-    assert p > 0  # sanity: never a garbage reconstruction
+    assert p > 0
 
     bpp = bits_per_pixel(payload, meta["H"], meta["W"])
     assert bpp > 0
 
 
 def test_codec_finer_quant_step_gives_higher_psnr(device):
-    """Basic rate-distortion sanity check: a finer quantization step should
-    reconstruct more accurately (higher PSNR), even for the untrained
-    baseline models -- if this ever fails, something is badly wrong in the
-    quantize/dequantize or entropy-coding wiring, not just model quality."""
+    """A finer quantisation step must not reduce PSNR, even for untrained
+    models; a failure would point to the quantise/entropy-coding path rather
+    than model quality."""
     img = _synthetic_image()
     gbticl_model = ContextGradientGBTICL().to(device)
     coeff_model = LaplaceCoeffModel().to(device)

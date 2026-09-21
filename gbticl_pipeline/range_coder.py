@@ -1,15 +1,10 @@
 """
-A real, working byte-oriented range coder (Subbotin-style, carryless).
-This is genuine arithmetic coding, not an entropy estimate -- it produces
-actual bytes you can measure, store, and decode back losslessly, driven by
-whatever probability model (coeff_model.py) hands it.
+Byte-oriented carry-less range coder (Subbotin style).
 
-DELIBERATELY CPU-ONLY, no .to(device) here. Range coding is a stateful,
-carry-propagating integer algorithm processed one symbol at a time -- there
-is no GPU parallelism to exploit within it, and forcing tensor ops onto a GPU
-for scalar integer bit-shuffling would be slower, not faster. codec.py pulls
-plain Python ints/numpy arrays out of GPU tensors right before calling into
-this module; see the "DEVICE BOUNDARY" note in codec.py's module docstring.
+Produces real compressed bytes from the probability distributions supplied by
+the coefficient models. It runs on the CPU only: range coding is a sequential
+integer algorithm, so the codec moves each distribution from the GPU to the
+host right before calling into this module.
 """
 
 import numpy as np
@@ -21,6 +16,8 @@ TOTAL_FREQ = 1 << 14  # precision of the probability model's integer frequencies
 
 
 class RangeEncoder:
+    """Encoder: encode(cum_freq, freq, tot_freq) per symbol, finish() returns the bytes."""
+
     def __init__(self):
         self.low = 0
         self.range = MASK32
@@ -52,6 +49,8 @@ class RangeEncoder:
 
 
 class RangeDecoder:
+    """Decoder for a RangeEncoder payload: get_freq() then decode() per symbol."""
+
     def __init__(self, data):
         self.data = data
         self.pos = 0
@@ -93,33 +92,18 @@ class RangeDecoder:
 
 
 def probs_to_freqs(probs, total=TOTAL_FREQ):
-    """Convert a probability array to integer frequencies summing EXACTLY to
-    `total`, with every symbol guaranteed freq >= 1 (so nothing is ever
-    unencodable). RangeEncoder/RangeDecoder both hard-code `tot_freq=total`
-    (they never read freqs.sum() themselves) -- if the returned freqs don't
-    sum to exactly `total`, the encoder's cumulative-frequency intervals and
-    the decoder's `range // tot_freq` division silently disagree, and the
-    decoder starts returning wrong symbols from the very first call. This is
-    a real, confirmed-reproduced bug fix, not defensive-only code: with a
-    wide symbol_range (this project uses up to 4401 symbols, to cover
-    near-lossless DC coefficients) and a highly-peaked distribution (e.g. a
-    fine-quantization DC-term Laplace distribution), the OLD implementation
-    (round each bin independently to >=1, then patch only the single largest
-    bin to absorb the total rounding error) could need a correction bigger
-    than the largest bin itself -- confirmed: a 4401-symbol Laplace(scale=3)
-    distribution rounded to a pre-correction sum of 20718 against a budget
-    of 16384 (a 4334 excess from ~4356 near-zero bins each floored up to 1),
-    while the largest bin only held 2704 -- the old single-bin patch then
-    went negative, silently clamped to 1, and left freqs summing to 18015,
-    not 16384. Decoding under a mismatched total desynced on symbol one.
+    """
+    Convert probabilities to integer frequencies that sum exactly to `total`.
 
-    Fixed via the standard "largest remainder" apportionment method: reserve
-    exactly 1 unit for every symbol up front (guaranteeing freq>=1 for all
-    n <= total symbols), then distribute the remaining budget across bins
-    proportionally to probability, rounding down and handing the leftover
-    few units to the bins with the largest fractional remainder. This always
-    produces freqs.sum() == total exactly, for any probability distribution,
-    as long as n_symbols <= total.
+    Every symbol receives a frequency of at least 1, so any symbol in range stays
+    encodable. The encoder and decoder both assume tot_freq == total; a frequency
+    table with a different sum makes the decoder diverge from the first symbol.
+
+    Largest-remainder apportionment: one unit is reserved per symbol, the rest is
+    distributed proportionally to the probabilities (rounded down), and the units
+    left over go to the symbols with the largest fractional remainder. Rounding
+    each bin independently and correcting only the largest bin fails for wide
+    symbol ranges with peaked distributions (the correction can exceed the bin).
     """
     probs = np.asarray(probs, dtype=np.float64)
     n = len(probs)
@@ -135,9 +119,7 @@ def probs_to_freqs(probs, total=TOTAL_FREQ):
     leftover = remaining - int(base.sum())
     if leftover > 0:
         frac = ideal - base
-        # hand the few leftover units to the bins closest to their next
-        # integer (largest fractional remainder) -- stable sort so ties
-        # resolve deterministically (same on encoder and decoder)
+        # Stable sort so ties resolve identically on encoder and decoder
         order = np.argsort(-frac, kind="stable")
         base[order[:leftover]] += 1
     freqs = 1 + base
@@ -146,11 +128,13 @@ def probs_to_freqs(probs, total=TOTAL_FREQ):
 
 
 def encode_symbol(encoder, probs, symbol_index, total=TOTAL_FREQ):
+    """Range-code one symbol index under the distribution `probs`."""
     freqs, cum = probs_to_freqs(probs, total)
     encoder.encode(int(cum[symbol_index]), int(freqs[symbol_index]), total)
 
 
 def decode_symbol(decoder, probs, total=TOTAL_FREQ):
+    """Decode one symbol index under the distribution `probs`."""
     freqs, cum = probs_to_freqs(probs, total)
     f = decoder.get_freq(total)
     k = int(np.searchsorted(cum, f, side="right") - 1)
@@ -160,8 +144,7 @@ def decode_symbol(decoder, probs, total=TOTAL_FREQ):
 
 
 if __name__ == "__main__":
-    # ---- self-test: round-trip a random sequence under a known distribution,
-    # and check compressed size lands close to the theoretical entropy ----
+    # Self-test: round-trip random symbols and compare the size with the entropy
     rng = np.random.default_rng(0)
     n_symbols = 21  # e.g. representing integers -10..10
     true_probs = np.exp(-np.abs(np.arange(-10, 11)) / 3.0)

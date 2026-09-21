@@ -1,3 +1,4 @@
+"""colour.py: RGB <-> YCbCr conversion."""
 import numpy as np
 
 from gbticl_pipeline.colour import rgb_to_ycbcr, ycbcr_to_rgb
@@ -7,8 +8,8 @@ def test_ycbcr_roundtrip_near_lossless():
     rng = np.random.default_rng(0)
     rgb = rng.integers(0, 256, (16, 16, 3), dtype=np.uint8)
     recon = ycbcr_to_rgb(rgb_to_ycbcr(rgb))
-    # rounding through the forward+inverse matrix isn't bit-exact, but
-    # should be within a couple of levels
+
+    # the round trip is not bit-exact because of rounding to uint8
     assert np.max(np.abs(recon.astype(int) - rgb.astype(int))) <= 2
 
 

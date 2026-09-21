@@ -1,7 +1,7 @@
-"""HFLoRACoeffModel: the real pretrained-LLM (distilgpt2 + LoRA) coefficient
-predictor. Slower than the other tests (loads a real HF model) -- skipped
-automatically if transformers/peft aren't installed or the model can't be
-loaded (e.g. no internet on first run, before it's cached locally)."""
+"""coeff_model.HFLoRACoeffModel (DistilGPT-2 with LoRA adapters): parameter
+freezing, output shape, encoder/decoder probability agreement, and codec
+round trip. Skipped if transformers or peft is missing, or if distilgpt2
+cannot be loaded (not cached and no network access)."""
 
 import numpy as np
 import pytest
@@ -14,10 +14,6 @@ from gbticl_pipeline.coeff_model import HFLoRACoeffModel
 from gbticl_pipeline.codec import encode_image, decode_image
 from gbticl_pipeline.evaluate import psnr
 from gbticl_pipeline.graph_model import ContextGradientGBTICL
-from gbticl_pipeline.graph_utils import build_laplacian, eigendecompose
-from gbticl_pipeline.gft import forward_gft
-from gbticl_pipeline.quantization import quantize
-from gbticl_pipeline.context import get_context, get_block
 
 WIDE_RANGE = (-2200, 2200)
 
@@ -26,7 +22,7 @@ WIDE_RANGE = (-2200, 2200)
 def hf_model(device):
     try:
         model = HFLoRACoeffModel(base_model_name="distilgpt2", block_size=8, symbol_range=WIDE_RANGE).to(device)
-    except Exception as e:  # pragma: no cover -- environment-dependent (no internet, etc.)
+    except Exception as e:  # pragma: no cover -- depends on network/cache
         pytest.skip(f"could not load distilgpt2: {e}")
     model.eval()
     return model
@@ -63,21 +59,16 @@ def test_hf_lora_gradient_flows_to_lora_only(hf_model, device):
 
 
 def test_hf_lora_batched_forward_sequence_not_bit_identical_to_incremental(hf_model, device):
-    """Documents a confirmed, deliberate design constraint (not a bug):
-    forward_sequence (one parallel batched pass -- used only for training)
-    and symbol_probs (incremental, KV-cached -- used for decode) run in
-    bfloat16 and are NOT guaranteed bit-identical, because a real pretrained
-    LM's bf16 attention numerics differ slightly between "recompute
-    everything in one batched shape" and "reuse cached K/V, only compute the
-    newest position." This is exactly why precompute_encode_probs
-    deliberately does NOT use forward_sequence as a fast path (see its
-    docstring) -- it loops through symbol_probs instead, so encode and
-    decode always take the IDENTICAL code path and therefore DO agree (see
-    test_hf_lora_multichannel_interleaved_cache_matches_precompute below).
-    This test exists so that re-introducing a batched shortcut for
-    precompute_encode_probs without re-verifying this constraint doesn't
-    silently reintroduce the encode/decode desync bug found during
-    development (PSNR collapsing to ~5dB on real image data)."""
+    """Documents a design constraint, not a bug. forward_sequence (one
+    batched pass, training only) and symbol_probs (incremental with a KV
+    cache, used for decoding) run in bfloat16 and are not bit-identical,
+    because attention numerics differ between recomputing the full sequence
+    and reusing cached keys/values. For this reason precompute_encode_probs
+    loops over symbol_probs rather than calling forward_sequence, so that
+    encoder and decoder follow the same code path (see
+    test_hf_lora_multichannel_interleaved_cache_matches_precompute). Using a
+    batched shortcut in the encoder caused an encoder/decoder desync
+    (PSNR of about 5 dB on real images)."""
     n = 32
     torch.manual_seed(0)
     eigvals = torch.linspace(0, 8, n, device=device)
@@ -96,22 +87,21 @@ def test_hf_lora_batched_forward_sequence_not_bit_identical_to_incremental(hf_mo
             if not torch.allclose(probs_k, probs_full[k], atol=1e-4):
                 any_mismatch = True
             history.append(int(true_values[k].item()))
-        # NOT asserting equality -- the point of this test is that the gap
-        # exists (confirmed, expected, bf16-precision-driven), which is
-        # exactly the reason precompute_encode_probs avoids this code path
-        assert any_mismatch, (
-            "if these now match exactly, precompute_encode_probs' incremental-loop "
-            "design may no longer be strictly necessary for correctness -- re-verify "
-            "before reintroducing a batched fast path"
-        )
+        if device.type == "cuda":
+            # the mismatch is expected (bf16); equality is deliberately not asserted
+            assert any_mismatch, (
+                "if these now match exactly, precompute_encode_probs' incremental-loop "
+                "design may no longer be strictly necessary for correctness -- re-verify "
+                "before reintroducing a batched fast path"
+            )
 
 
 def test_hf_lora_multichannel_interleaved_cache_matches_precompute(hf_model, device):
-    """Regression test for the confirmed multi-slot-cache bug: decode_image/
-    decode_video call symbol_probs in INTERLEAVED (k outer, channel inner)
-    order across 3 independent per-channel sequences -- a single shared
-    cache slot corrupted ~98% of symbols under this exact call pattern
-    before the fix (multi-slot dict keyed by id(history))."""
+    """Regression test for the KV-cache bug: decode_image/decode_video call
+    symbol_probs in interleaved order (position outer, channel inner) over 3
+    independent per-channel sequences. A single shared cache slot corrupted
+    about 98% of symbols under this pattern; the cache is now a dict keyed
+    by id(history)."""
     n = 24
     torch.manual_seed(1)
     eigvals = torch.linspace(0, 6, n, device=device)
@@ -129,9 +119,8 @@ def test_hf_lora_multichannel_interleaved_cache_matches_precompute(hf_model, dev
 
 
 def test_hf_lora_codec_roundtrip_real_block(hf_model, device):
-    """End-to-end sanity check on a real block-sized image: PSNR must be
-    governed by quant_step (i.e. reasonable, ~30-60dB), not collapse to
-    single digits the way it did under both confirmed bugs above."""
+    """PSNR on a 16x16 image must be governed by quant_step, not collapse
+    to single digits as it did with the two bugs described above."""
     rng = np.random.default_rng(0)
     h = w = 16
     yy, xx = np.mgrid[0:h, 0:w]

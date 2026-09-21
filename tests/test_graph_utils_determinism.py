@@ -1,8 +1,7 @@
-"""Regression tests for the eigendecompose bug fixed in graph_utils.py:
-degenerate/repeated eigenvalues caused NaN gradients through eigh's backward
-pass, and (theoretically, even if not reproduced in-process on this exact
-torch/cuSOLVER build) sign/ordering non-determinism could desync encoder and
-decoder since no graph is ever transmitted between them."""
+"""graph_utils.eigendecompose: regression tests for the eigenbasis. Repeated
+eigenvalues gave NaN gradients through the backward pass of eigh, and any
+non-determinism in eigenvector sign or order would desynchronise encoder and
+decoder, since the graph is never transmitted."""
 
 import torch
 
@@ -11,10 +10,9 @@ from gbticl_pipeline.graph_utils import build_laplacian, build_laplacian_batch, 
 
 
 def test_eigendecompose_no_nan_gradient_on_degenerate_laplacian(device):
-    """The exact failure case found and fixed: a maximally-degenerate (all
-    edge weights equal) 8x8 block Laplacian has ~31-33 of 64 eigenvalues
-    repeated, which made eigh's backward pass through the eigenvectors
-    produce NaN gradients before the symmetry-breaking fix."""
+    """With all edge weights equal, the 8x8 block Laplacian has about 31-33
+    of 64 eigenvalues repeated, which gave NaN gradients from eigh's backward
+    pass before the symmetry-breaking perturbation was added."""
     block_size = 8
     n_edges = len(edge_list(block_size))
     weights = torch.ones(n_edges, dtype=torch.float64, device=device, requires_grad=True)
@@ -32,10 +30,9 @@ def test_eigendecompose_no_nan_gradient_on_degenerate_laplacian(device):
 
 
 def test_eigendecompose_deterministic_across_calls(device):
-    """Encoder and decoder each call eigendecompose independently on
-    (by construction) bit-identical L -- if the perturbation weren't
-    deterministic, or eigh's own sign convention varied, they'd derive
-    different bases and silently desync, since U is never transmitted."""
+    """Encoder and decoder each call eigendecompose on identical L; the
+    results must be bit-identical, otherwise the two sides use different
+    bases."""
     block_size = 8
     n_edges = len(edge_list(block_size))
     weights = torch.ones(n_edges, dtype=torch.float64, device=device)
@@ -56,17 +53,17 @@ def test_eigendecompose_reduces_degeneracy(device):
     eigvals, _ = eigendecompose(L)
 
     n_unique = len(torch.unique(torch.round(eigvals * 1e6)))
-    # before the fix this was ~31-33/64; the perturbation should break the
-    # vast majority of the degeneracy without materially altering the spectrum
+
+    # before the fix this was about 31-33 of 64; the perturbation should
+    # resolve most of the degeneracy
     assert n_unique >= 55, f"expected the symmetry-breaking perturbation to " \
                             f"resolve most degeneracy, got {n_unique}/64 unique eigenvalues"
 
 
 def test_eigendecompose_batched_matches_single(device):
-    """build_laplacian_batch + eigendecompose must behave the same as the
-    single-matrix path (used by codec.py) for every item in the batch, since
-    training.py relies on this equivalence to make batched training a valid
-    stand-in for the per-block inference loop."""
+    """Batched build_laplacian_batch + eigendecompose must match the
+    single-matrix path used by codec.py, so that batched training in
+    training.py is consistent with per-block encoding."""
     block_size = 8
     n_edges = len(edge_list(block_size))
     torch.manual_seed(0)
@@ -85,9 +82,7 @@ def test_eigendecompose_batched_matches_single(device):
 
 
 def test_eigendecompose_sign_canonicalization(device):
-    """Each eigenvector's largest-magnitude entry should be positive after
-    canonicalization -- and flipping the sign of an input eigenvector should
-    not change the canonicalized output (the whole point of canonicalizing)."""
+    """The largest-magnitude entry of every eigenvector must be positive."""
     block_size = 8
     n_edges = len(edge_list(block_size))
     torch.manual_seed(1)

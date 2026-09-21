@@ -1,7 +1,7 @@
 """Graph Fourier Transform: forward (pixels -> coefficients) and inverse.
 
-Both are just matrix multiplies against U, so they run on GPU for free
-whenever `block`/`coeffs`/`U` are already CUDA tensors -- no separate code path.
+Both are matrix products with the eigenvector matrix U and run on whichever
+device the tensors live on.
 """
 
 import torch
@@ -40,8 +40,7 @@ def inverse_gft(coeffs, U, block_size):
 
 
 def forward_gft_batch(blocks, U):
-    """Batched forward GFT for training.py: many blocks, each with its own
-    (per-block-predicted) eigenbasis, transformed in one call.
+    """Batched forward GFT: many blocks, each with its own eigenbasis (used in training).
 
     Args:
         blocks: (B, block_size, block_size, 3) tensor, same device as U
