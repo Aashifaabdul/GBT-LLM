@@ -30,13 +30,13 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# Results are not tracked, except the graph figures
+# Results tracking
 !results/
 results/*
+!results/ablation_summary.csv
+!results/visual_comparison.png
+!results/graphical_performance_comparison.png
 !results/figures/
-results/figures/*
-!results/figures/full_image_graph_heatmap.png
-!results/figures/full_image_graph_zoom.png
-!results/figures/graph_visualization.png
-!results/figures/gbt_llm_architecture/
-!results/figures/gbt_llm_architecture/*
+!results/charts/
+!results/full_1080p_60frames/
+!results/submission_results/

@@ -229,7 +229,7 @@ def reassemble_video_ffmpeg(frame_dir, out_mp4, fps=30):
     cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_path),
            "-fps_mode", "vfr", "-pix_fmt", "yuv420p", str(out_mp4)]
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True)
+        res = subprocess.run(cmd, capture_output=True, text=True, cwd=str(frame_dir))
         if res.returncode == 0:
             print(f"  -> Saved reassembled MP4: {out_mp4.name}")
     except FileNotFoundError:

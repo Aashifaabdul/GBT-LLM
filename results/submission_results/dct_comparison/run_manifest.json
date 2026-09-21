@@ -1,0 +1,37 @@
+{
+  "ablations": {
+    "dct_laplace": {
+      "description": "Fixed DCT basis with the closed-form Laplace entropy model.",
+      "needs_coefficient_checkpoint": false,
+      "needs_graph_checkpoint": false,
+      "pipeline_name": "dct",
+      "status": "planned"
+    }
+  },
+  "command": "comparison/run_dct.py --dry-run",
+  "created_utc": "2026-09-15T06:35:00.407738+00:00",
+  "project": "GBT-ICL + DistilGPT-2/LoRA Graph Transform Codec",
+  "resolved_paths": {
+    "coeff_checkpoint": "C:\\E\\Dissertation\\Dataset\\GBT-LLM\\checkpoints\\stageC.pt",
+    "gbticl_checkpoint": "C:\\E\\Dissertation\\Dataset\\GBT-LLM\\checkpoints\\stageA.pt",
+    "legacy_tiny_checkpoint": null
+  },
+  "settings": {
+    "base_model_name": "distilgpt2",
+    "coeff_checkpoint": "checkpoints/stageC.pt",
+    "crop": 64,
+    "dry_run": true,
+    "experiment_name": "dct_comparison",
+    "fps": 5.0,
+    "frames_dir": null,
+    "full_frame": false,
+    "gbticl_checkpoint": "checkpoints/stageA.pt",
+    "legacy_tiny_checkpoint": null,
+    "max_frames": 1,
+    "output_root": "results/submission_results",
+    "quant_steps": "8",
+    "resume": false,
+    "sequence": "both"
+  },
+  "status": "planned"
+}

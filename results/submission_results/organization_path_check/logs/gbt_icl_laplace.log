@@ -1,0 +1,2 @@
+$ C:\Users\aashi\AppData\Local\Programs\Python\Python311\python.exe C:\E\Dissertation\Dataset\GBT-LLM\run_dataset_pipeline.py --ablation metalearner_no_llm --sequence both --out-dir C:\E\Dissertation\Dataset\GBT-LLM\results\submission_results\organization_path_check\codec_outputs --quant-steps 8 --fps 5.0 --crop 64 --max-frames 1 --gbticl-checkpoint C:\E\Dissertation\Dataset\GBT-LLM\checkpoints\stageA.pt
+

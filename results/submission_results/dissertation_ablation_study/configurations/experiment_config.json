@@ -1,0 +1,17 @@
+{
+  "base_model_name": "distilgpt2",
+  "coeff_checkpoint": "checkpoints/stageC.pt",
+  "crop": 64,
+  "dry_run": true,
+  "experiment_name": "dissertation_ablation_study",
+  "fps": 5.0,
+  "frames_dir": null,
+  "full_frame": false,
+  "gbticl_checkpoint": "checkpoints/stageA.pt",
+  "legacy_tiny_checkpoint": null,
+  "max_frames": 1,
+  "output_root": "results/submission_results",
+  "quant_steps": "8",
+  "resume": false,
+  "sequence": "both"
+}

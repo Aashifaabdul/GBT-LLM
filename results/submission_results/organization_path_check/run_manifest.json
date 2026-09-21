@@ -1,0 +1,59 @@
+{
+  "ablations": {
+    "dct_laplace": {
+      "description": "Fixed DCT basis with the closed-form Laplace entropy model.",
+      "needs_coefficient_checkpoint": false,
+      "needs_graph_checkpoint": false,
+      "pipeline_name": "dct",
+      "status": "planned"
+    },
+    "gbt_icl_distilgpt2_lora": {
+      "description": "Proposed method: GBT-ICL + DistilGPT-2 adapted with LoRA.",
+      "needs_coefficient_checkpoint": true,
+      "needs_graph_checkpoint": true,
+      "pipeline_name": "full",
+      "status": "planned"
+    },
+    "gbt_icl_laplace": {
+      "description": "GBT-ICL meta-learner with no learned coefficient predictor.",
+      "needs_coefficient_checkpoint": false,
+      "needs_graph_checkpoint": true,
+      "pipeline_name": "metalearner_no_llm",
+      "status": "planned"
+    },
+    "uniform_gbt_laplace": {
+      "description": "Uniform non-adaptive graph transform with the Laplace entropy model.",
+      "needs_coefficient_checkpoint": false,
+      "needs_graph_checkpoint": false,
+      "pipeline_name": "nonadaptive_gbt",
+      "status": "planned"
+    }
+  },
+  "command": "ablations/run_ablation_study.py --dry-run --experiment-name organization_path_check",
+  "created_utc": "2026-09-15T06:19:44.281426+00:00",
+  "project": "GBT-ICL + DistilGPT-2/LoRA Graph Transform Codec",
+  "resolved_paths": {
+    "coeff_checkpoint": "C:\\E\\Dissertation\\Dataset\\GBT-LLM\\checkpoints\\stageC.pt",
+    "gbticl_checkpoint": "C:\\E\\Dissertation\\Dataset\\GBT-LLM\\checkpoints\\stageA.pt",
+    "legacy_tiny_checkpoint": null
+  },
+  "settings": {
+    "ablations": "dct_laplace,uniform_gbt_laplace,gbt_icl_laplace,gbt_icl_distilgpt2_lora",
+    "base_model_name": "distilgpt2",
+    "coeff_checkpoint": "checkpoints/stageC.pt",
+    "crop": 64,
+    "dry_run": true,
+    "experiment_name": "organization_path_check",
+    "fps": 5.0,
+    "frames_dir": null,
+    "full_frame": false,
+    "gbticl_checkpoint": "checkpoints/stageA.pt",
+    "legacy_tiny_checkpoint": null,
+    "max_frames": 1,
+    "output_root": "results/submission_results",
+    "quant_steps": "8",
+    "resume": false,
+    "sequence": "both"
+  },
+  "status": "planned"
+}
