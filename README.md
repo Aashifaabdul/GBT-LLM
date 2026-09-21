@@ -1,6 +1,6 @@
 # GBT-LLM
 
-Graph-based signal-adaptive transforms and large language model entropy priors for adaptive image and video compression.
+Graph-based signal-adaptive transforms and large language model entropy priors for adaptive image compression.
 
 MSc dissertation, Aston University. Author: Aashifa Abdul Samath Parveen.
 
