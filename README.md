@@ -6,6 +6,10 @@ MSc dissertation, Aston University.
 Author: Aashifa Abdul Samath Parveen.
 Supervisor : Dr Debaleena Roy 
 
+## Architecture
+
+![GBT-LLM encoder and decoder architecture](docs/architecture.png)
+
 ## Folder structure
 
 ```text
