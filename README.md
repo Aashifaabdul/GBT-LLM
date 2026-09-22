@@ -2,7 +2,7 @@
 
 Graph-based signal-adaptive transforms and large language model entropy priors for adaptive image compression.
 
-Author: Aashifa Abdul Samath Parveen.
+Author: Aashifa Parveen Abdul Samath .
 
 Supervisor : Dr Debaleena Roy 
 
